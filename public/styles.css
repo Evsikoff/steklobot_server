@@ -17,6 +17,11 @@
 
 * { box-sizing: border-box; }
 
+/* Атрибут hidden должен побеждать display из классов: у .login задан display:grid,
+   который иначе перекрывает [hidden]{display:none} из браузерной таблицы стилей,
+   и экран входа остаётся видимым поверх панели. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
