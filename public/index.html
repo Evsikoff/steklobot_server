@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Стекольщик — панель оператора</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚗</text></svg>" />
+</head>
+<body>
+  <div id="login" class="login" hidden>
+    <form class="login__card" id="login-form">
+      <h1>Стекольщик</h1>
+      <p class="muted">Панель оператора</p>
+      <input type="password" id="login-password" placeholder="Пароль" autocomplete="current-password" required />
+      <button type="submit">Войти</button>
+      <div class="login__error" id="login-error"></div>
+    </form>
+  </div>
+
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand">🚗 Стекольщик <span class="muted">панель оператора</span></div>
+      <nav class="tabs">
+        <button class="tab is-active" data-tab="chats">Чаты <span class="counter" id="c-chats"></span></button>
+        <button class="tab" data-tab="escalations">Менеджеру <span class="counter warn" id="c-esc"></span></button>
+        <button class="tab" data-tab="orchestration">Оркестрация <span class="counter" id="c-runs"></span></button>
+        <button class="tab" data-tab="errors">Интеграции <span class="counter err" id="c-err"></span></button>
+      </nav>
+      <div class="topbar__right">
+        <span class="conn" id="conn"><i></i><span>подключение…</span></span>
+        <button class="ghost" id="logout">Выйти</button>
+      </div>
+    </header>
+
+    <main>
+      <!-- ------------------------------------------------ ЧАТЫ -->
+      <section class="view is-active" data-view="chats">
+        <div class="split">
+          <aside class="threads">
+            <input class="search" id="thread-search" placeholder="Поиск по имени или chat id" />
+            <div class="threads__list" id="thread-list"></div>
+          </aside>
+          <div class="chat" id="chat-pane">
+            <div class="empty">Выберите диалог слева</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ------------------------------------- ЗАПРОСЫ К МЕНЕДЖЕРУ -->
+      <section class="view" data-view="escalations">
+        <div class="toolbar">
+          <div class="chips" id="esc-filters">
+            <button class="chip is-active" data-status="open">Открытые</button>
+            <button class="chip" data-status="new">Новые</button>
+            <button class="chip" data-status="in_progress">В работе</button>
+            <button class="chip" data-status="done">Закрытые</button>
+            <button class="chip" data-status="all">Все</button>
+          </div>
+        </div>
+        <div class="cards" id="esc-list"></div>
+      </section>
+
+      <!-- ---------------------------------------- ОРКЕСТРАЦИЯ -->
+      <section class="view" data-view="orchestration">
+        <div class="orch-legend">
+          <span><b>Как это работает:</b> сообщения клиента копятся в буфере <span class="dot buf"></span>, через окно склейки
+          стартует прогон <span class="dot run"></span>. Если клиент пишет снова до ответа LLM — текущий прогон
+          вытесняется <span class="dot sup"></span>, а новый уходит в LLM уже со всеми N сообщениями.</span>
+          <span class="muted" id="orch-settings"></span>
+        </div>
+        <div class="live" id="orch-live"></div>
+        <h3 class="section-title">Прогоны</h3>
+        <div class="runs" id="run-list"></div>
+      </section>
+
+      <!-- ----------------------------------- ИНТЕГРАЦИИ И ОШИБКИ -->
+      <section class="view" data-view="errors">
+        <div class="health" id="health"></div>
+        <div class="toolbar">
+          <div class="chips" id="ext-filters">
+            <button class="chip is-active" data-service="all">Все</button>
+            <button class="chip" data-service="errors">Только ошибки</button>
+            <button class="chip" data-service="telegram">Telegram</button>
+            <button class="chip" data-service="gemini">LLM</button>
+            <button class="chip" data-service="price_list">Прайс</button>
+            <button class="chip" data-service="supabase">Supabase</button>
+          </div>
+          <button class="ghost" id="refresh-price">Обновить прайс</button>
+        </div>
+        <div class="events" id="ext-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
