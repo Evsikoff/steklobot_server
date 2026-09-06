@@ -97,6 +97,9 @@ export async function handleStaffMessage(message: tg.TgMessage): Promise<void> {
   if (topicId == null) return;
   if (message.from?.is_bot) return;
 
+  // служебные топики (General и т.п.) не относятся к диалогам с клиентами
+  if (config.telegram.ignoredTopicIds.includes(topicId)) return;
+
   const text = textOf(message);
   if (!text) return;
 

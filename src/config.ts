@@ -16,6 +16,16 @@ function optional(name: string, fallback = ''): string {
   return value && value.trim() ? value.trim() : fallback;
 }
 
+function numList(name: string, fallback: number[]): number[] {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!raw.trim()) return [];
+  return raw
+    .split(',')
+    .map((part) => Number(part.trim()))
+    .filter((value) => Number.isFinite(value));
+}
+
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw || !raw.trim()) return fallback;
@@ -55,6 +65,13 @@ export const config = {
     managerChatId: required('TELEGRAM_MANAGER_CHAT_ID'),
     webhookSecret: required('TELEGRAM_WEBHOOK_SECRET'),
     apiBase: optional('TELEGRAM_API_BASE', 'https://api.telegram.org'),
+    /**
+     * Топики чата менеджеров, которые бот не обрабатывает.
+     * По умолчанию 1 и 2: топик 1 — служебный General супергруппы, туда
+     * попадают системные сообщения и общая переписка, не относящаяся к клиентам.
+     * Пустое значение переменной отключает фильтр.
+     */
+    ignoredTopicIds: numList('TELEGRAM_IGNORED_TOPIC_IDS', [1, 2]),
   },
 
   supabase: {
