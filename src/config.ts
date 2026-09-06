@@ -80,6 +80,9 @@ export const config = {
     timeoutMs: num('SUPABASE_TIMEOUT_MS', 15_000),
   },
 
+  /** провайдер по умолчанию, если в app_settings ещё ничего не сохранено */
+  llmProviderDefault: optional('LLM_PROVIDER', 'gemini'),
+
   llm: {
     apiKey: required('GEMINI_API_KEY'),
     model: optional('GEMINI_MODEL', 'gemini-3.7-flash'),
@@ -89,6 +92,19 @@ export const config = {
     timeoutMs: num('LLM_TIMEOUT_MS', 45_000),
     /** сколько раз просим модель переделать невалидный JSON */
     maxJsonRetries: num('LLM_MAX_JSON_RETRIES', 2),
+  },
+
+  /**
+   * API Bazaar — OpenAI-совместимый эндпоинт. Переменные необязательные:
+   * сервер должен стартовать, даже если используется только Gemini.
+   * Проверка заполненности делается в момент переключения провайдера.
+   */
+  apiBazaar: {
+    url: optional('API_BAZAAR_URL'),
+    key: optional('API_BAZAAR_KEY'),
+    model: optional('API_BAZAAR_MODEL'),
+    /** некоторые модели за прокси не поддерживают response_format — по умолчанию не шлём */
+    jsonMode: optional('API_BAZAAR_JSON_MODE', '') === '1',
   },
 
   orchestrator: {

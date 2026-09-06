@@ -103,7 +103,7 @@ export interface Escalation {
 
 export interface ExternalEvent {
   id?: number;
-  service: 'telegram' | 'gemini' | 'price_list' | 'supabase';
+  service: 'telegram' | 'gemini' | 'apibazaar' | 'price_list' | 'supabase';
   operation: string;
   status: ExternalStatus;
   http_status: number | null;

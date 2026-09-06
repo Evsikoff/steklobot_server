@@ -1,26 +1,17 @@
 import { config } from '../../config.js';
 import { ExternalError, httpJson } from '../external.js';
 import { SYSTEM_PROMPT } from './prompt.js';
+import type { GenerateCtx, LlmCallResult, LlmProvider, ProviderReadiness, Turn } from './provider.js';
 
-export interface Turn {
-  role: 'user' | 'model';
-  text: string;
-}
-
-export interface LlmCallResult {
-  text: string;
-  finishReason: string | null;
-  usage: Record<string, unknown> | null;
+function readiness(): ProviderReadiness {
+  return config.llm.apiKey ? { ok: true, missing: [] } : { ok: false, missing: ['GEMINI_API_KEY'] };
 }
 
 /**
  * Один вызов Gemini generateContent.
  * `turns` — вся цепочка: исходный запрос, ответ модели, просьба переделать JSON и т.д.
  */
-export async function generate(
-  turns: Turn[],
-  ctx: { threadId?: string | null; runId?: string | null; signal?: AbortSignal; attempt?: number },
-): Promise<LlmCallResult> {
+async function generate(turns: Turn[], ctx: GenerateCtx): Promise<LlmCallResult> {
   const model = config.llm.model.replace(/^models\//, '');
   const url = `${config.llm.apiBase}/v1beta/models/${model}:generateContent`;
 
@@ -78,3 +69,11 @@ export async function generate(
 
   return { text, finishReason: candidate?.finishReason ?? null, usage: body.usageMetadata ?? null };
 }
+
+export const geminiProvider: LlmProvider = {
+  id: 'gemini',
+  label: 'Gemini',
+  model: () => config.llm.model.replace(/^models\//, ''),
+  readiness,
+  generate,
+};

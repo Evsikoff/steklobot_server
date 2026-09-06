@@ -10,6 +10,7 @@ const state = {
   externalEvents: [],
   orchestrator: new Map(),      // threadId -> { buffered, bufferedTexts, activeRunId, debounceArmed }
   settings: {},
+  llmProviders: [],
   health: null,
   tab: 'chats',
   activeThreadId: null,
@@ -139,6 +140,7 @@ async function boot() {
   state.runs = data.runs;
   state.externalEvents = data.externalEvents;
   state.settings = data.settings;
+  state.llmProviders = data.llmProviders || [];
   state.runEvents = new Map();
   for (const event of data.runEvents) {
     if (!state.runEvents.has(event.run_id)) state.runEvents.set(event.run_id, []);
@@ -552,8 +554,10 @@ const RUN_STATUS = {
 };
 
 function renderOrchestration() {
+  const active = state.llmProviders.find((p) => p.active);
   $('#orch-settings').textContent =
-    `окно склейки ${state.settings.debounceMs} мс · переспросов JSON до ${state.settings.maxJsonRetries} · модель ${state.settings.model || '—'}`;
+    `окно склейки ${state.settings.debounceMs} мс · переспросов JSON до ${state.settings.maxJsonRetries} · ` +
+    `провайдер ${active ? `${active.label} (${active.model})` : '—'}`;
 
   // живое состояние по чатам
   const live = $('#orch-live');
@@ -678,12 +682,63 @@ function renderRun(run) {
 
 const SERVICE_LABELS = {
   telegram: 'Telegram',
-  gemini: 'LLM (Gemini)',
+  gemini: 'LLM · Gemini',
+  apibazaar: 'LLM · API Bazaar',
   price_list: 'Прайс-лист',
   supabase: 'Supabase',
+  llm_gemini: 'LLM · Gemini',
+  llm_apibazaar: 'LLM · API Bazaar',
 };
 
+const SERVICE_HINTS = {
+  gemini: 'Google Gemini через generativelanguage.googleapis.com',
+  apibazaar: 'OpenAI-совместимый эндпоинт из API_BAZAAR_URL',
+};
+
+function renderProviderSwitch() {
+  const box = $('#provider-switch');
+  box.textContent = '';
+  box.append(el('div', 'provider__title', 'Провайдер LLM'));
+  box.append(
+    el(
+      'div',
+      'provider__hint',
+      'Переключается на лету и сохраняется в базе. Уже идущие прогоны доработают на прежнем провайдере.',
+    ),
+  );
+
+  const list = el('div', 'provider__list');
+  for (const p of state.llmProviders) {
+    const item = el('button', `provider__item${p.active ? ' is-active' : ''}`);
+    const name = el('div', 'provider__name');
+    name.append(el('span', null, p.label));
+    if (p.active) name.append(el('span', 'badge live', 'активен'));
+    item.append(name);
+    item.append(el('div', 'provider__model', p.configured ? `Модель: ${p.model}` : 'Не настроен'));
+    if (!p.configured) {
+      item.append(el('div', 'provider__missing', `Не заданы: ${p.missing.join(', ')}`));
+      item.disabled = true;
+      item.title = 'Добавьте переменные в secret group Northflank и перезапустите сервис';
+    } else if (!p.active) {
+      item.addEventListener('click', () => switchProvider(p.id));
+    }
+    list.append(item);
+  }
+  box.append(list);
+}
+
+async function switchProvider(id) {
+  try {
+    const data = await api('/api/llm-provider', { method: 'POST', body: { provider: id } });
+    state.llmProviders = data.providers;
+    scheduleRender();
+  } catch (err) {
+    alert(`Не удалось переключить провайдера: ${err.message}`);
+  }
+}
+
 function renderErrors() {
+  renderProviderSwitch();
   document.querySelectorAll('#ext-filters .chip').forEach((chip) =>
     chip.classList.toggle('is-active', chip.dataset.service === state.extFilter),
   );
@@ -706,6 +761,7 @@ function renderErrors() {
   const events = state.externalEvents.filter((event) => {
     if (state.extFilter === 'all') return true;
     if (state.extFilter === 'errors') return event.status === 'error';
+    if (state.extFilter === 'llm') return event.service === 'gemini' || event.service === 'apibazaar';
     return event.service === state.extFilter;
   });
 

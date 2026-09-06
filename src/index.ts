@@ -1,8 +1,9 @@
 import { assertConfig, config, supabaseUrlNotes } from './config.js';
-import { initDb, pingDb } from './db.js';
+import { getSetting, initDb, pingDb } from './db.js';
 import { createServer } from './http/server.js';
 import { setWebhook } from './services/telegram.js';
 import { loadPriceList } from './services/priceList.js';
+import { activeProvider, isProviderId, restoreProvider } from './services/llm/index.js';
 import { log, errorMessage } from './logger.js';
 
 async function main() {
@@ -17,6 +18,18 @@ async function main() {
   await pingDb()
     .then(() => log.info('Supabase доступна'))
     .catch((err) => log.error('Supabase недоступна', errorMessage(err)));
+
+  // восстанавливаем выбранный провайдер LLM из настроек
+  await getSetting<string>('llm_provider')
+    .then((saved) => {
+      const { fellBackFrom } = restoreProvider(saved);
+      const provider = activeProvider();
+      log.info(`провайдер LLM: ${provider.label} (${provider.model()})`, {
+        источник: isProviderId(saved) ? 'app_settings' : 'LLM_PROVIDER/по умолчанию',
+        откат_с: fellBackFrom,
+      });
+    })
+    .catch((err) => log.error('не удалось прочитать настройку провайдера LLM', errorMessage(err)));
 
   await loadPriceList()
     .then((price) => log.info(`прайс: ${price.rows.length} строк`, { error: price.error }))

@@ -3,7 +3,7 @@ import * as db from '../db.js';
 import { log, errorMessage } from '../logger.js';
 import { composeReply, fallbackReply, type ComposeResult } from '../domain/replyBuilder.js';
 import { loadPriceList } from '../services/priceList.js';
-import { generate, type Turn } from '../services/llm/gemini.js';
+import { activeProvider, describeModel, type Turn } from '../services/llm/index.js';
 import { buildRepairPrompt, buildUserPrompt } from '../services/llm/prompt.js';
 import { validateLlmJson } from './jsonGuard.js';
 import * as tg from '../services/telegram.js';
@@ -117,6 +117,12 @@ export async function executeRun(params: {
       },
     ];
 
+    // провайдер фиксируется на весь прогон: переключение в панели во время
+    // работы не должно менять модель на середине цепочки переспросов
+    const provider = activeProvider();
+    const modelLabel = describeModel(provider.id, provider.model());
+    await db.updateRun(run.id, { llm_model: modelLabel });
+
     const maxAttempts = config.llm.maxJsonRetries + 1;
     let answer: ReturnType<typeof validateLlmJson> | null = null;
     let lastRaw = '';
@@ -127,12 +133,14 @@ export async function executeRun(params: {
       ensureAlive(signal);
 
       const llmStarted = Date.now();
-      stageEvent(run, 'llm_request', `Запрос к ${config.llm.model}, попытка ${attempts}/${maxAttempts}`, {
+      stageEvent(run, 'llm_request', `Запрос к ${provider.label} (${provider.model()}), попытка ${attempts}/${maxAttempts}`, {
         attempt: attempts,
         turns: turns.length,
+        provider: provider.id,
+        model: provider.model(),
       });
 
-      const result = await generate(turns, { threadId: thread.id, runId: run.id, signal, attempt: attempts });
+      const result = await provider.generate(turns, { threadId: thread.id, runId: run.id, signal, attempt: attempts });
       lastRaw = result.text;
       ensureAlive(signal);
 

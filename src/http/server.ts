@@ -10,6 +10,7 @@ import * as tg from '../services/telegram.js';
 import { handleUpdate, sendAsManager } from '../ingest.js';
 import { cancelActive, orchestratorSnapshot } from '../orchestrator/index.js';
 import { invalidatePriceCache, loadPriceList, priceListStatus } from '../services/priceList.js';
+import { activeProvider, applyProvider, getProvider, isProviderId, providersOverview } from '../services/llm/index.js';
 import { log, errorMessage } from '../logger.js';
 import { checkPassword, clearSessionCookie, isAuthenticated, issueToken, requireAuth, setSessionCookie } from './auth.js';
 
@@ -85,9 +86,9 @@ export function createServer(): http.Server {
         settings: {
           debounceMs: config.orchestrator.debounceMs,
           maxJsonRetries: config.llm.maxJsonRetries,
-          model: config.llm.model,
           historyLimit: config.orchestrator.historyLimit,
         },
+        llmProviders: providersOverview(),
       });
     } catch (err) {
       next(err);
@@ -213,9 +214,46 @@ export function createServer(): http.Server {
       ? { ok: true, detail: `${price.rows.length} строк${price.fromCache ? ' (кэш)' : ''}` }
       : { ok: false, detail: price.error ?? 'Прайс недоступен' };
 
-    checks.gemini = { ok: true, detail: `Модель ${config.llm.model} (проверяется при первом запросе)` };
+    for (const p of providersOverview()) {
+      checks[`llm_${p.id}`] = {
+        ok: p.configured,
+        detail:
+          (p.active ? 'активен · ' : 'не активен · ') +
+          (p.configured ? `модель ${p.model}` : `не заданы ${p.missing.join(', ')}`),
+      };
+    }
 
     res.json({ checks, priceList: priceListStatus() });
+  });
+
+  api.get('/llm-provider', (_req, res) => {
+    res.json({ providers: providersOverview() });
+  });
+
+  api.post('/llm-provider', async (req, res, next) => {
+    try {
+      const id = req.body?.provider;
+      if (!isProviderId(id)) {
+        res.status(400).json({ error: 'Неизвестный провайдер' });
+        return;
+      }
+      // не даём переключиться на провайдера без секретов — иначе бот молча
+      // сломается на первом же сообщении клиента
+      const ready = getProvider(id).readiness();
+      if (!ready.ok) {
+        res.status(400).json({
+          error: `${getProvider(id).label} не настроен: не заданы ${ready.missing.join(', ')}. Добавьте переменные в secret group и перезапустите сервис.`,
+        });
+        return;
+      }
+      applyProvider(id);
+      await db.setSetting('llm_provider', id);
+      const provider = activeProvider();
+      log.info(`провайдер LLM переключён на ${provider.label} (${provider.model()})`);
+      res.json({ providers: providersOverview() });
+    } catch (err) {
+      next(err);
+    }
   });
 
   api.post('/price-list/refresh', async (_req, res) => {

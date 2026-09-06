@@ -243,3 +243,23 @@ main { padding: 18px; }
 .banner__close {
   background: transparent; border: 0; color: #ffb4ae; font-size: 20px; line-height: 1; padding: 0 4px;
 }
+
+/* ------------------------------------------------- переключатель LLM */
+.provider {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 16px; margin-bottom: 16px;
+}
+.provider__title { font-weight: 600; margin-bottom: 4px; }
+.provider__hint { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+.provider__list { display: flex; gap: 10px; flex-wrap: wrap; }
+.provider__item {
+  flex: 1 1 260px; text-align: left; display: flex; flex-direction: column; gap: 4px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 14px; color: var(--text);
+}
+.provider__item:hover:not(:disabled) { border-color: var(--muted); }
+.provider__item.is-active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.provider__item:disabled { opacity: .55; cursor: not-allowed; }
+.provider__name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.provider__model { color: var(--muted); font-size: 12px; }
+.provider__missing { color: var(--err); font-size: 12px; }

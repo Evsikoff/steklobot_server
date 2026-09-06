@@ -263,6 +263,25 @@ export async function listExternalEvents(limit = 200, onlyErrors = false): Promi
   );
 }
 
+// -------------------------------------------------------------- settings
+
+/** Значение из app_settings; null, если ключа нет */
+export async function getSetting<T = unknown>(key: string): Promise<T | null> {
+  const rows = await q<{ key: string; value: T }[]>('app_settings.get', () =>
+    client.from('app_settings').select('*').eq('key', key).limit(1),
+  );
+  return rows?.[0]?.value ?? null;
+}
+
+/** Upsert настройки — используется переключателем провайдера LLM */
+export async function setSetting(key: string, value: unknown): Promise<void> {
+  await q<unknown>('app_settings.set', () =>
+    client
+      .from('app_settings')
+      .upsert({ key, value, updated_at: new Date().toISOString() } as never, { onConflict: 'key' }),
+  );
+}
+
 /** Быстрая проверка доступности БД для /healthz и индикатора в UI */
 export async function pingDb(): Promise<void> {
   await q<unknown>('healthcheck', () => client.from('app_settings').select('key').limit(1));
