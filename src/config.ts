@@ -23,6 +23,29 @@ function num(name: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+/**
+ * SUPABASE_URL должен быть origin проекта. Частая ошибка — вставить туда полный
+ * REST-эндпоинт (".../rest/v1/"): клиент допишет свой путь, и PostgREST ответит
+ * PGRST125 "Invalid path specified in request URL". Приводим значение к origin.
+ */
+export const supabaseUrlNotes: string[] = [];
+function supabaseOrigin(): string {
+  const raw = required('SUPABASE_URL');
+  if (!raw) return '';
+  let url = raw.trim();
+  const before = url;
+  url = url.replace(/\/+$/, '');
+  url = url.replace(/\/rest\/v1$/i, '');
+  url = url.replace(/\/+$/, '');
+  if (url !== before) {
+    supabaseUrlNotes.push(
+      `SUPABASE_URL приведён к origin: убран лишний путь/слэш («${before}» → «${url}»). ` +
+        'В переменной должен быть только адрес проекта, например https://abcdef.supabase.co',
+    );
+  }
+  return url;
+}
+
 export const config = {
   port: num('PORT', 8080),
   publicBaseUrl: optional('PUBLIC_BASE_URL'),
@@ -35,7 +58,7 @@ export const config = {
   },
 
   supabase: {
-    url: required('SUPABASE_URL'),
+    url: supabaseOrigin(),
     serviceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY'),
     timeoutMs: num('SUPABASE_TIMEOUT_MS', 15_000),
   },

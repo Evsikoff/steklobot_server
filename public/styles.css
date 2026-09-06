@@ -227,3 +227,14 @@ main { padding: 18px; }
   .event { grid-template-columns: 1fr; gap: 4px; }
   .tabs .tab { padding: 8px; }
 }
+
+/* ------------------------------------------------------- баннер ошибки */
+.banner {
+  display: flex; align-items: center; gap: 12px;
+  background: rgba(248,81,73,.14); border-bottom: 1px solid var(--err);
+  color: #ffb4ae; padding: 10px 18px; font-size: 13px;
+}
+.banner__text { flex: 1; }
+.banner__close {
+  background: transparent; border: 0; color: #ffb4ae; font-size: 20px; line-height: 1; padding: 0 4px;
+}

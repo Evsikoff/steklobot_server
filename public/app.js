@@ -103,11 +103,27 @@ $('#login-form').addEventListener('submit', async (event) => {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Ошибка входа');
     showApp();
-    await boot();
+    // ошибки загрузки данных — это уже не про пароль, показываем их баннером,
+    // иначе непонятно, что именно не сработало
+    boot().catch((err) => showBanner(`Не удалось загрузить данные: ${err.message}`));
   } catch (err) {
     $('#login-error').textContent = err.message;
   }
 });
+
+/** Баннер с ошибкой поверх интерфейса */
+function showBanner(message) {
+  let bar = $('#banner');
+  if (!bar) {
+    bar = el('div', 'banner');
+    bar.id = 'banner';
+    const close = el('button', 'banner__close', '×');
+    close.addEventListener('click', () => bar.remove());
+    bar.append(el('span', 'banner__text'), close);
+    $('#app').prepend(bar);
+  }
+  bar.querySelector('.banner__text').textContent = message;
+}
 
 $('#logout').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
@@ -726,6 +742,7 @@ function renderErrors() {
     showApp();
     await boot();
   } catch (err) {
-    showLogin();
+    if (String(err.message).includes('Требуется вход')) showLogin();
+    else showBanner(`Не удалось загрузить данные: ${err.message}`);
   }
 })();

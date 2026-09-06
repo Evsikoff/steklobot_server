@@ -1,4 +1,4 @@
-import { assertConfig, config } from './config.js';
+import { assertConfig, config, supabaseUrlNotes } from './config.js';
 import { initDb, pingDb } from './db.js';
 import { createServer } from './http/server.js';
 import { setWebhook } from './services/telegram.js';
@@ -7,6 +7,7 @@ import { log, errorMessage } from './logger.js';
 
 async function main() {
   assertConfig();
+  for (const note of supabaseUrlNotes) log.warn(note);
   initDb();
 
   const server = createServer();
