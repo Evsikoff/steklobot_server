@@ -153,7 +153,7 @@ export const config = {
 
   recognition: {
     /** успевшее в это окно распознавание сразу подтверждаем клиенту; 0 — не подтверждать */
-    quickReplyMs: num('RECOGNITION_QUICK_REPLY_MS', 10_000),
+    quickReplyMs: num('RECOGNITION_QUICK_REPLY_MS', 60_000),
   },
 
   orchestrator: {
