@@ -48,6 +48,111 @@ function textOf(message: tg.TgMessage): string {
   return (message.text ?? message.caption ?? '').trim();
 }
 
+/** 75 -> 1:15 */
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/** Скачивает файл клиента по file_id */
+async function fetchFile(fileId: string, thread: Thread, maxBytes: number): Promise<Buffer> {
+  const file = await tg.getFile(fileId, { threadId: thread.id });
+  if (!file.file_path) throw new Error('Telegram не отдал путь к файлу');
+  return tg.downloadFile(file.file_path, { threadId: thread.id }, { maxBytes });
+}
+
+/** Скачивает голосовое из Telegram и расшифровывает его Gemini Transcribe Live */
+async function transcribeVoiceMessage(voice: tg.TgVoice, thread: Thread): Promise<string> {
+  if (voice.duration > config.transcribe.maxDurationSec) {
+    throw new Error(`запись длиннее ${config.transcribe.maxDurationSec} с`);
+  }
+  if (voice.file_size != null && voice.file_size > config.transcribe.maxFileBytes) {
+    throw new Error(`файл больше ${config.transcribe.maxFileBytes} байт`);
+  }
+
+  const audio = await fetchFile(voice.file_id, thread, config.transcribe.maxFileBytes);
+  const result = await transcribeVoice(audio, { threadId: thread.id });
+
+  log.info('голосовое распознано', {
+    threadId: thread.id,
+    model: result.model,
+    durationSec: Math.round(result.durationSec),
+    chars: result.text.length,
+  });
+  return result.text;
+}
+
+/**
+ * Картинка в сообщении: либо сжатое фото (берём самый крупный вариант),
+ * либо изображение, отправленное файлом «без сжатия».
+ */
+function imageOf(message: tg.TgMessage): { fileId: string; mimeType: string; fileSize?: number } | null {
+  const photo = message.photo?.length ? message.photo[message.photo.length - 1] : null;
+  if (photo) return { fileId: photo.file_id, mimeType: 'image/jpeg', fileSize: photo.file_size };
+
+  const doc = message.document;
+  if (doc?.mime_type && /^image\/(jpeg|png|webp|heic|heif)$/i.test(doc.mime_type)) {
+    return { fileId: doc.file_id, mimeType: doc.mime_type.toLowerCase(), fileSize: doc.file_size };
+  }
+  return null;
+}
+
+interface Recognized {
+  text: string;
+  meta: Record<string, unknown>;
+  /** подпись к расшифровке в топике менеджеров */
+  mirrorPrefix: string;
+}
+
+/**
+ * Голосовое и фото автомобиля бот читает сам, и заявка идёт обычным путём.
+ * null — это другое вложение либо распознать не удалось: тогда сообщение
+ * уходит менеджеру целиком, как и всё, что бот прочитать не может.
+ */
+async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Recognized | null> {
+  const caption = textOf(message);
+
+  if (message.voice && transcribeReadiness().ok) {
+    try {
+      const transcript = await transcribeVoiceMessage(message.voice, thread);
+      return {
+        text: [caption, transcript].filter(Boolean).join('\n'),
+        meta: { source: 'voice', duration_sec: message.voice.duration, file_unique_id: message.voice.file_unique_id },
+        mirrorPrefix: `🎤 Расшифровка (голосовое ${formatDuration(message.voice.duration)})`,
+      };
+    } catch (err) {
+      log.warn('не удалось распознать голосовое, отдаём менеджеру', { threadId: thread.id, error: errorMessage(err) });
+      return null;
+    }
+  }
+
+  const image = imageOf(message);
+  if (image && visionReadiness().ok) {
+    try {
+      if (image.fileSize != null && image.fileSize > config.vision.maxFileBytes) {
+        throw new Error(`файл больше ${config.vision.maxFileBytes} байт`);
+      }
+      const bytes = await fetchFile(image.fileId, thread, config.vision.maxFileBytes);
+      const photo = await describeCarPhoto(bytes, image.mimeType, { threadId: thread.id });
+      // ни марки, ни модели — подбирать не по чему, пусть смотрит менеджер
+      if (!photo.isCar || (!photo.make && !photo.model)) {
+        log.info('на фото не распознан автомобиль, отдаём менеджеру', { threadId: thread.id });
+        return null;
+      }
+      return {
+        text: [caption, photoToPromptText(photo)].filter(Boolean).join('\n'),
+        meta: { source: 'photo', vision: photo },
+        mirrorPrefix: `🖼 Распознано на фото (${photoSummary(photo)})`,
+      };
+    } catch (err) {
+      log.warn('не удалось распознать фото, отдаём менеджеру', { threadId: thread.id, error: errorMessage(err) });
+      return null;
+    }
+  }
+
+  return null;
+}
+
 /**
  * Вложения бот не читает, а фото или голосовое часто и есть сама заявка.
  * Такое сообщение копируем менеджеру целиком и отдаём ему диалог.
@@ -164,12 +269,14 @@ async function handleUnreadableMessage(
 /** Сообщение от клиента в личке бота */
 export async function handleCustomerMessage(message: tg.TgMessage): Promise<void> {
   const thread = await ensureThread(message);
-  const text = textOf(message);
   const attachment = attachmentOf(message);
 
-  // фото с подписью тоже сюда: подпись бот прочитает, а картинку — нет,
-  // и отвечать по половине заявки хуже, чем отдать её менеджеру
-  if (attachment || !text) {
+  // голосовое и фото автомобиля бот распознаёт сам; остальные вложения — и всё,
+  // что распознать не вышло, — уходят менеджеру вместе с самим файлом
+  const recognized = attachment ? await recognizeMedia(thread, message) : null;
+  const text = recognized ? recognized.text : textOf(message);
+
+  if (!text || (attachment && !recognized)) {
     await handleUnreadableMessage(thread, message, attachment);
     return;
   }
@@ -179,17 +286,22 @@ export async function handleCustomerMessage(message: tg.TgMessage): Promise<void
     role: 'customer',
     text,
     tg_message_id: message.message_id,
-    meta,
+    meta: recognized?.meta,
   });
 
   await db.updateThread(thread.id, { last_message_at: new Date().toISOString(), last_message_text: text });
 
   if (thread.topic_id != null) {
+    const mirror = { messageThreadId: thread.topic_id, ctx: { threadId: thread.id } };
+    // сам файл менеджеру тоже нужен: расшифровку можно перепроверить на слух,
+    // а фото — глазами, если бот определил машину неверно
+    if (recognized) {
+      await tg
+        .copyMessage(config.telegram.managerChatId, thread.customer_chat_id, message.message_id, mirror)
+        .catch((err) => log.warn('не удалось переслать вложение в топик', errorMessage(err)));
+    }
     await tg
-      .sendMessage(config.telegram.managerChatId, `${mirrorPrefix}: ${text}`, {
-        messageThreadId: thread.topic_id,
-        ctx: { threadId: thread.id },
-      })
+      .sendMessage(config.telegram.managerChatId, `${recognized ? recognized.mirrorPrefix : '👤 Клиент'}: ${text}`, mirror)
       .catch((err) => log.warn('не удалось продублировать сообщение клиента в топик', errorMessage(err)));
   }
 

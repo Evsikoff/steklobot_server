@@ -72,13 +72,11 @@ export interface TgMessage {
   document?: TgDocument;
   chat: { id: number; type: string; title?: string; first_name?: string; last_name?: string; username?: string };
   from?: { id: number; is_bot: boolean; first_name?: string; last_name?: string; username?: string };
-  // вложения: содержимое нам не нужно — важен сам факт и тип, файл уходит менеджеру через copyMessage
-  photo?: unknown[];
-  voice?: unknown;
+  // остальные вложения бот не читает: содержимое не нужно — важен сам факт и тип,
+  // файл уходит менеджеру через copyMessage
   audio?: unknown;
   video?: unknown;
   video_note?: unknown;
-  document?: unknown;
   animation?: unknown;
   sticker?: unknown;
   location?: unknown;
