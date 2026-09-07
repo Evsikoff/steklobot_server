@@ -26,6 +26,15 @@ function numList(name: string, fallback: number[]): number[] {
     .filter((value) => Number.isFinite(value));
 }
 
+function strList(name: string, fallback: string[]): string[] {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  return raw
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw || !raw.trim()) return fallback;
@@ -105,6 +114,45 @@ export const config = {
     model: optional('API_BAZAAR_MODEL'),
     /** некоторые модели за прокси не поддерживают response_format — по умолчанию не шлём */
     jsonMode: optional('API_BAZAAR_JSON_MODE', '') === '1',
+  },
+
+  /**
+   * Распознавание голосовых сообщений клиента — Gemini 3.5 Transcribe Live
+   * (Live API, WebSocket). Ключ тот же, что и у обычного Gemini: GEMINI_API_KEY.
+   * Работает независимо от выбранного провайдера LLM: даже когда ответы генерит
+   * API Bazaar, голос расшифровывает Gemini.
+   */
+  transcribe: {
+    enabled: optional('TRANSCRIBE_ENABLED', '1') !== '0',
+    model: optional('TRANSCRIBE_MODEL', 'gemini-3.5-transcribe-live'),
+    /** хост Live API; отделён от REST, потому что схема другая (wss://) */
+    wsBase: optional('GEMINI_WS_BASE', 'wss://generativelanguage.googleapis.com'),
+    /** подсказка по языку (BCP-47). Пустое значение — автоопределение модели */
+    languageCodes: strList('TRANSCRIBE_LANGUAGE_CODES', ['ru-RU']),
+    /** у Live-сессии лимит 10 минут — длиннее не отправляем, сразу зовём менеджера */
+    maxDurationSec: num('TRANSCRIBE_MAX_DURATION_SEC', 600),
+    /** Bot API отдаёт файлы не больше 20 МБ */
+    maxFileBytes: num('TRANSCRIBE_MAX_FILE_BYTES', 20 * 1024 * 1024),
+    /** общий бюджет на распознавание одного сообщения */
+    timeoutMs: num('TRANSCRIBE_TIMEOUT_MS', 60_000),
+    /** пауза между 100-мс кусками аудио; 0 — отдаём файл максимально быстро */
+    chunkDelayMs: num('TRANSCRIBE_CHUNK_DELAY_MS', 0),
+    /** сколько ждём «хвост» расшифровки после audioStreamEnd, если модель молчит */
+    finalizeMs: num('TRANSCRIBE_FINALIZE_MS', 4_000),
+    /** укороченное ожидание после turnComplete — вдруг за ним придёт ещё кусок */
+    graceMs: num('TRANSCRIBE_GRACE_MS', 1_200),
+  },
+
+  /**
+   * Распознавание фотографий автомобиля. Тот же ключ и та же модель Gemini,
+   * что и для ответов (по умолчанию GEMINI_MODEL) — просто отдельный вызов
+   * с картинкой, результат подмешивается в сообщение клиента текстом.
+   */
+  vision: {
+    enabled: optional('VISION_ENABLED', '1') !== '0',
+    model: optional('VISION_MODEL', optional('GEMINI_MODEL', 'gemini-3.7-flash')),
+    maxFileBytes: num('VISION_MAX_FILE_BYTES', 20 * 1024 * 1024),
+    timeoutMs: num('VISION_TIMEOUT_MS', 45_000),
   },
 
   orchestrator: {

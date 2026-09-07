@@ -2,6 +2,8 @@ import { config } from './config.js';
 import * as db from './db.js';
 import * as tg from './services/telegram.js';
 import { enqueue, cancelActive } from './orchestrator/index.js';
+import { transcribeReadiness, transcribeVoice } from './services/transcribe.js';
+import { describeCarPhoto, photoSummary, photoToPromptText, visionReadiness } from './services/vision.js';
 import { log, errorMessage } from './logger.js';
 import type { Thread } from './types.js';
 
@@ -177,13 +179,14 @@ export async function handleCustomerMessage(message: tg.TgMessage): Promise<void
     role: 'customer',
     text,
     tg_message_id: message.message_id,
+    meta,
   });
 
   await db.updateThread(thread.id, { last_message_at: new Date().toISOString(), last_message_text: text });
 
   if (thread.topic_id != null) {
     await tg
-      .sendMessage(config.telegram.managerChatId, `👤 Клиент: ${text}`, {
+      .sendMessage(config.telegram.managerChatId, `${mirrorPrefix}: ${text}`, {
         messageThreadId: thread.topic_id,
         ctx: { threadId: thread.id },
       })

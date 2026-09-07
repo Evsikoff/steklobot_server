@@ -4,6 +4,8 @@ import { createServer } from './http/server.js';
 import { setWebhook } from './services/telegram.js';
 import { loadPriceList } from './services/priceList.js';
 import { activeProvider, isProviderId, restoreProvider } from './services/llm/index.js';
+import { transcribeModel, transcribeReadiness } from './services/transcribe.js';
+import { visionModel, visionReadiness } from './services/vision.js';
 import { log, errorMessage } from './logger.js';
 
 async function main() {
@@ -30,6 +32,14 @@ async function main() {
       });
     })
     .catch((err) => log.error('не удалось прочитать настройку провайдера LLM', errorMessage(err)));
+
+  const transcribe = transcribeReadiness();
+  if (transcribe.ok) log.info(`распознавание голосовых: ${transcribeModel()}`);
+  else log.warn(`распознавание голосовых выключено: ${transcribe.reason}`);
+
+  const vision = visionReadiness();
+  if (vision.ok) log.info(`распознавание фото: ${visionModel()}`);
+  else log.warn(`распознавание фото выключено: ${vision.reason}`);
 
   await loadPriceList()
     .then((price) => log.info(`прайс: ${price.rows.length} строк`, { error: price.error }))

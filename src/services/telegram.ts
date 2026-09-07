@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { httpJson } from './external.js';
+import { ExternalError, httpJson, summarizeBody, tracked } from './external.js';
 
 const api = (method: string) => `${config.telegram.apiBase}/bot${config.telegram.botToken}/${method}`;
 
@@ -35,12 +35,41 @@ async function call<T>(
   return (res.body as { result: T }).result;
 }
 
+/** Голосовое сообщение: Telegram всегда отдаёт его в Ogg/Opus */
+export interface TgVoice {
+  file_id: string;
+  file_unique_id: string;
+  duration: number;
+  mime_type?: string;
+  file_size?: number;
+}
+
+/** Одна из версий фотографии; Telegram присылает массив от миниатюры к оригиналу */
+export interface TgPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
+export interface TgDocument {
+  file_id: string;
+  file_unique_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
 export interface TgMessage {
   message_id: number;
   message_thread_id?: number;
   date: number;
   text?: string;
   caption?: string;
+  voice?: TgVoice;
+  photo?: TgPhotoSize[];
+  document?: TgDocument;
   chat: { id: number; type: string; title?: string; first_name?: string; last_name?: string; username?: string };
   from?: { id: number; is_bot: boolean; first_name?: string; last_name?: string; username?: string };
   // вложения: содержимое нам не нужно — важен сам факт и тип, файл уходит менеджеру через copyMessage
@@ -102,6 +131,54 @@ export async function createForumTopic(name: string, ctx: CallCtx = {}): Promise
     'createForumTopic',
     { chat_id: config.telegram.managerChatId, name: name.slice(0, 128) },
     ctx,
+  );
+}
+
+export async function getFile(fileId: string, ctx: CallCtx = {}): Promise<{ file_path?: string; file_size?: number }> {
+  return call<{ file_path?: string; file_size?: number }>('getFile', { file_id: fileId }, ctx);
+}
+
+/**
+ * Скачивание файла бота. Отдельно от `call`, потому что тело здесь бинарное,
+ * а адрес другой: /file/bot<TOKEN>/<file_path> вместо /bot<TOKEN>/<method>.
+ */
+export async function downloadFile(
+  filePath: string,
+  ctx: CallCtx = {},
+  opts: { maxBytes?: number; timeoutMs?: number } = {},
+): Promise<Buffer> {
+  const url = `${config.telegram.apiBase}/file/bot${config.telegram.botToken}/${filePath}`;
+  return tracked(
+    { service: 'telegram', operation: 'downloadFile', threadId: ctx.threadId, runId: ctx.runId, request: { filePath } },
+    async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30_000);
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          throw new ExternalError('telegram', 'downloadFile', `HTTP ${res.status}: ${summarizeBody(text)}`, res.status);
+        }
+        const buffer = Buffer.from(await res.arrayBuffer());
+        if (opts.maxBytes && buffer.length > opts.maxBytes) {
+          throw new ExternalError(
+            'telegram',
+            'downloadFile',
+            `Файл ${buffer.length} байт больше лимита ${opts.maxBytes}`,
+            res.status,
+          );
+        }
+        return { value: buffer, httpStatus: res.status, response: { bytes: buffer.length } };
+      } catch (err) {
+        if (err instanceof ExternalError) throw err;
+        if ((err as Error)?.name === 'AbortError') {
+          throw new ExternalError('telegram', 'downloadFile', `Таймаут ${opts.timeoutMs ?? 30_000} мс`);
+        }
+        throw new ExternalError('telegram', 'downloadFile', `Сетевая ошибка: ${(err as Error)?.message ?? String(err)}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
   );
 }
 

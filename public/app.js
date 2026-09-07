@@ -400,7 +400,12 @@ function renderChatPane() {
     const node = el('div', `msg ${message.role}`);
     node.append(el('div', null, message.text));
     const author =
-      message.role === 'customer' ? 'клиент' :
+      message.role === 'customer'
+        ? message.meta?.source === 'voice'
+          ? `клиент 🎤 голосовое${message.meta?.duration_sec ? ` ${message.meta.duration_sec} с` : ''}`
+          : message.meta?.source === 'photo'
+            ? 'клиент 🖼 фото'
+            : 'клиент' :
       message.role === 'assistant' ? 'LLM' :
       message.role === 'manager' ? `менеджер${message.meta?.author ? ` (${message.meta.author})` : ''}` : 'система';
     node.append(el('div', 'msg__meta', `${author} · ${time(message.created_at)}`));
@@ -690,6 +695,8 @@ const SERVICE_LABELS = {
   supabase: 'Supabase',
   llm_gemini: 'LLM · Gemini',
   llm_apibazaar: 'LLM · API Bazaar',
+  transcribe: 'Распознавание голосовых',
+  vision: 'Распознавание фото',
 };
 
 const SERVICE_HINTS = {
