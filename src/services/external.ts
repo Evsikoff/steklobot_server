@@ -109,7 +109,7 @@ export async function httpJson(
   url: string,
   init: RequestInit & { timeoutMs?: number },
   opts: { retries?: number; retryDelayMs?: number } = {},
-): Promise<{ status: number; body: unknown; text: string }> {
+): Promise<{ status: number; body: unknown; text: string; headers: Headers }> {
   const retries = opts.retries ?? 2;
   const retryDelayMs = opts.retryDelayMs ?? 700;
   let lastError: unknown;
@@ -135,7 +135,7 @@ export async function httpJson(
           if (!res.ok) {
             throw new ExternalError(ctx.service, ctx.operation, describeHttpError(res.status, body, text), res.status, body);
           }
-          return { value: { status: res.status, body, text }, httpStatus: res.status, response: body };
+          return { value: { status: res.status, body, text, headers: res.headers }, httpStatus: res.status, response: body };
         } catch (err) {
           if (err instanceof ExternalError) throw err;
           if ((err as Error)?.name === 'AbortError') {

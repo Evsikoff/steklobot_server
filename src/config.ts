@@ -117,30 +117,21 @@ export const config = {
   },
 
   /**
-   * Распознавание голосовых сообщений клиента — Gemini 3.5 Transcribe Live
-   * (Live API, WebSocket). Ключ тот же, что и у обычного Gemini: GEMINI_API_KEY.
-   * Работает независимо от выбранного провайдера LLM: даже когда ответы генерит
-   * API Bazaar, голос расшифровывает Gemini.
+   * Распознавание голосовых сообщений клиента — файловая Gemini 3.5 Transcribe.
+   * Ключ тот же, что и у обычного Gemini: GEMINI_API_KEY. Работает независимо
+   * от выбранного провайдера LLM.
    */
   transcribe: {
     enabled: optional('TRANSCRIBE_ENABLED', '1') !== '0',
-    model: optional('TRANSCRIBE_MODEL', 'gemini-3.5-transcribe-live'),
-    /** хост Live API; отделён от REST, потому что схема другая (wss://) */
-    wsBase: optional('GEMINI_WS_BASE', 'wss://generativelanguage.googleapis.com'),
+    model: optional('TRANSCRIBE_MODEL', 'gemini-3.5-transcribe'),
     /** подсказка по языку (BCP-47). Пустое значение — автоопределение модели */
     languageCodes: strList('TRANSCRIBE_LANGUAGE_CODES', ['ru-RU']),
-    /** у Live-сессии лимит 10 минут — длиннее не отправляем, сразу зовём менеджера */
+    /** голосовые длиннее лимита сразу отдаём менеджеру */
     maxDurationSec: num('TRANSCRIBE_MAX_DURATION_SEC', 600),
     /** Bot API отдаёт файлы не больше 20 МБ */
     maxFileBytes: num('TRANSCRIBE_MAX_FILE_BYTES', 20 * 1024 * 1024),
     /** общий бюджет на распознавание одного сообщения */
     timeoutMs: num('TRANSCRIBE_TIMEOUT_MS', 60_000),
-    /** пауза между 100-мс кусками аудио; 0 — отдаём файл максимально быстро */
-    chunkDelayMs: num('TRANSCRIBE_CHUNK_DELAY_MS', 0),
-    /** сколько ждём «хвост» расшифровки после audioStreamEnd, если модель молчит */
-    finalizeMs: num('TRANSCRIBE_FINALIZE_MS', 4_000),
-    /** укороченное ожидание после turnComplete — вдруг за ним придёт ещё кусок */
-    graceMs: num('TRANSCRIBE_GRACE_MS', 1_200),
   },
 
   /**
@@ -158,6 +149,11 @@ export const config = {
      * и на тесном бюджете ответ приходит пустым с finishReason=MAX_TOKENS.
      */
     maxOutputTokens: num('VISION_MAX_OUTPUT_TOKENS', 2048),
+  },
+
+  recognition: {
+    /** успевшее в это окно распознавание сразу подтверждаем клиенту; 0 — не подтверждать */
+    quickReplyMs: num('RECOGNITION_QUICK_REPLY_MS', 10_000),
   },
 
   orchestrator: {

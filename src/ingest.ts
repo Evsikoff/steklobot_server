@@ -61,7 +61,7 @@ async function fetchFile(fileId: string, thread: Thread, maxBytes: number): Prom
   return tg.downloadFile(file.file_path, { threadId: thread.id }, { maxBytes });
 }
 
-/** Скачивает голосовое из Telegram и расшифровывает его Gemini Transcribe Live */
+/** Скачивает голосовое из Telegram и расшифровывает его Gemini Transcribe */
 async function transcribeVoiceMessage(voice: tg.TgVoice, thread: Thread): Promise<string> {
   if (voice.duration > config.transcribe.maxDurationSec) {
     throw new Error(`запись длиннее ${config.transcribe.maxDurationSec} с`);
@@ -71,7 +71,11 @@ async function transcribeVoiceMessage(voice: tg.TgVoice, thread: Thread): Promis
   }
 
   const audio = await fetchFile(voice.file_id, thread, config.transcribe.maxFileBytes);
-  const result = await transcribeVoice(audio, { threadId: thread.id });
+  const result = await transcribeVoice(audio, {
+    threadId: thread.id,
+    durationSec: voice.duration,
+    mimeType: voice.mime_type || 'audio/ogg',
+  });
 
   log.info('голосовое распознано', {
     threadId: thread.id,
@@ -102,6 +106,13 @@ interface Recognized {
   meta: Record<string, unknown>;
   /** подпись к расшифровке в топике менеджеров */
   mirrorPrefix: string;
+  /** короткое подтверждение результата непосредственно клиенту */
+  customerReply: string;
+}
+
+function quoteForCustomer(text: string, maxLength = 700): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  return compact.length <= maxLength ? compact : `${compact.slice(0, maxLength - 1).trimEnd()}…`;
 }
 
 /**
@@ -128,6 +139,7 @@ async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Re
           text: [caption, transcript].filter(Boolean).join('\n'),
           meta: { source: 'voice', duration_sec: message.voice.duration, file_unique_id: message.voice.file_unique_id },
           mirrorPrefix: `🎤 Расшифровка (голосовое ${formatDuration(message.voice.duration)})`,
+          customerReply: `Расшифровал голосовое: «${quoteForCustomer(transcript)}». Использую этот текст в заявке.`,
         },
         reason: null,
       };
@@ -159,6 +171,7 @@ async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Re
           text: [caption, photoToPromptText(photo)].filter(Boolean).join('\n'),
           meta: { source: 'photo', vision: photo },
           mirrorPrefix: `🖼 Распознано на фото (${photoSummary(photo)})`,
+          customerReply: `Распознал автомобиль по фото: ${photoSummary(photo)}. Использую эти данные в заявке.`,
         },
         reason: null,
       };
@@ -170,6 +183,31 @@ async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Re
   }
 
   return { result: null, reason: null };
+}
+
+async function sendQuickRecognitionReply(thread: Thread, recognized: Recognized, recognitionMs: number): Promise<void> {
+  try {
+    const sent = await tg.sendMessage(thread.customer_chat_id, recognized.customerReply, { ctx: { threadId: thread.id } });
+    await db.insertMessage({
+      thread_id: thread.id,
+      role: 'assistant',
+      text: recognized.customerReply,
+      tg_message_id: sent.message_id,
+      meta: {
+        recognitionAck: true,
+        source: recognized.meta.source ?? null,
+        recognitionMs,
+      },
+    });
+    await db.updateThread(thread.id, {
+      last_message_at: new Date().toISOString(),
+      last_message_text: recognized.customerReply,
+    });
+    log.info('результат распознавания сразу отправлен клиенту', { threadId: thread.id, recognitionMs });
+  } catch (err) {
+    // Подтверждение не должно ломать основной подбор: итоговый ответ всё равно отправит пайплайн.
+    log.warn('не удалось отправить клиенту быстрое подтверждение распознавания', errorMessage(err));
+  }
 }
 
 /**
@@ -293,6 +331,7 @@ async function handleUnreadableMessage(
 export async function handleCustomerMessage(message: tg.TgMessage): Promise<void> {
   const thread = await ensureThread(message);
   const attachment = attachmentOf(message);
+  const recognitionStartedAt = Date.now();
 
   // голосовое и фото автомобиля бот распознаёт сам; остальные вложения — и всё,
   // что распознать не вышло, — уходят менеджеру вместе с самим файлом
@@ -300,6 +339,7 @@ export async function handleCustomerMessage(message: tg.TgMessage): Promise<void
     ? await recognizeMedia(thread, message)
     : { result: null, reason: null };
   const recognized = recognition.result;
+  const recognitionMs = Date.now() - recognitionStartedAt;
   const text = recognized ? recognized.text : textOf(message);
 
   if (!text || (attachment && !recognized)) {
@@ -317,6 +357,10 @@ export async function handleCustomerMessage(message: tg.TgMessage): Promise<void
 
   await db.updateThread(thread.id, { last_message_at: new Date().toISOString(), last_message_text: text });
 
+  if (recognized && config.recognition.quickReplyMs > 0 && recognitionMs <= config.recognition.quickReplyMs) {
+    await sendQuickRecognitionReply(thread, recognized, recognitionMs);
+  }
+
   if (thread.topic_id != null) {
     const mirror = { messageThreadId: thread.topic_id, ctx: { threadId: thread.id } };
     // сам файл менеджеру тоже нужен: расшифровку можно перепроверить на слух,
@@ -331,8 +375,9 @@ export async function handleCustomerMessage(message: tg.TgMessage): Promise<void
       .catch((err) => log.warn('не удалось продублировать сообщение клиента в топик', errorMessage(err)));
   }
 
-  if (thread.mode === 'ai') {
-    enqueue(thread, { id: saved.id, text });
+  const currentThread = (await db.getThread(thread.id)) ?? thread;
+  if (currentThread.mode === 'ai') {
+    enqueue(currentThread, { id: saved.id, text });
   }
 }
 

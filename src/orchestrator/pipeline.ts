@@ -89,13 +89,15 @@ export async function executeRun(params: {
     ensureAlive(signal);
 
     const history = allMessages
-      .filter((m) => !inputIds.has(m.id) && m.role !== 'system')
+      .filter((m) => !inputIds.has(m.id) && m.role !== 'system' && m.meta?.recognitionAck !== true)
       .slice(-config.orchestrator.historyLimit)
       .map((m) => ({ role: m.role, text: m.text }));
 
     // предыдущий ответ бота: клиент часто спрашивает про уже показанные варианты
     // («в чём разница?»), и модель, и сервер должны понимать, о чём именно вопрос
-    const lastAssistant = [...allMessages].reverse().find((m) => m.role === 'assistant');
+    const lastAssistant = [...allMessages]
+      .reverse()
+      .find((m) => m.role === 'assistant' && m.meta?.recognitionAck !== true);
     const lastOffer = {
       ids: Array.isArray(lastAssistant?.meta?.matchedPriceIds)
         ? (lastAssistant.meta.matchedPriceIds as unknown[]).map(String)
