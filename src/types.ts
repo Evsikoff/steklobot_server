@@ -131,10 +131,15 @@ export interface PriceRow {
   in_stock: string;
 }
 
+/** Как показывать найденные строки: все подряд или только самые дешёвые */
+export type PriceSelection = 'all' | 'cheapest';
+
 /** Схема ответа LLM (см. промпт) */
 export interface LlmAnswer {
   reply: string;
   lookupStatus: 'not_requested' | 'need_details' | 'found' | 'found_multiple' | 'not_found';
   matchedPriceIds: string[];
+  /** "cheapest" — клиент попросил самое дешёвое, отбор делает сервер */
+  selection: PriceSelection;
   escalate: Escalate | null;
 }
