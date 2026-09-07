@@ -48,151 +48,129 @@ function textOf(message: tg.TgMessage): string {
   return (message.text ?? message.caption ?? '').trim();
 }
 
-/** 75 → «1:15» */
-function formatDuration(seconds: number): string {
-  const total = Math.max(0, Math.round(seconds));
-  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
-}
+/**
+ * Вложения бот не читает, а фото или голосовое часто и есть сама заявка.
+ * Такое сообщение копируем менеджеру целиком и отдаём ему диалог.
+ * needsManager = false у стикеров и GIF: забирать диалог из-за смайлика незачем.
+ * Названия — в винительном падеже: подставляются в «прислал …» и «передал … менеджеру».
+ */
+const ATTACHMENT_KINDS: { field: keyof tg.TgMessage; name: string; needsManager: boolean }[] = [
+  { field: 'photo', name: 'фото', needsManager: true },
+  { field: 'voice', name: 'голосовое сообщение', needsManager: true },
+  { field: 'video_note', name: 'видеосообщение', needsManager: true },
+  { field: 'video', name: 'видео', needsManager: true },
+  { field: 'audio', name: 'аудио', needsManager: true },
+  { field: 'document', name: 'файл', needsManager: true },
+  { field: 'location', name: 'геопозицию', needsManager: true },
+  { field: 'contact', name: 'контакт', needsManager: true },
+  { field: 'animation', name: 'GIF', needsManager: false },
+  { field: 'sticker', name: 'стикер', needsManager: false },
+];
 
-/** Скачивает файл клиента по file_id */
-async function fetchFile(fileId: string, thread: Thread, maxBytes: number): Promise<Buffer> {
-  const file = await tg.getFile(fileId, { threadId: thread.id });
-  if (!file.file_path) throw new Error('Telegram не отдал путь к файлу');
-  return tg.downloadFile(file.file_path, { threadId: thread.id }, { maxBytes });
-}
+type AttachmentKind = (typeof ATTACHMENT_KINDS)[number];
 
-/** Скачивает голосовое из Telegram и расшифровывает его Gemini Transcribe Live */
-async function transcribeVoiceMessage(voice: tg.TgVoice, thread: Thread): Promise<string> {
-  if (voice.duration > config.transcribe.maxDurationSec) {
-    throw new Error(`запись длиннее ${config.transcribe.maxDurationSec} с`);
-  }
-  if (voice.file_size != null && voice.file_size > config.transcribe.maxFileBytes) {
-    throw new Error(`файл больше ${config.transcribe.maxFileBytes} байт`);
-  }
+const attachmentOf = (message: tg.TgMessage): AttachmentKind | null =>
+  ATTACHMENT_KINDS.find((kind) => message[kind.field] != null) ?? null;
 
-  const audio = await fetchFile(voice.file_id, thread, config.transcribe.maxFileBytes);
-  const result = await transcribeVoice(audio, { threadId: thread.id });
+/**
+ * Альбом приходит несколькими апдейтами с общим media_group_id: копию в топик
+ * делаем для каждого файла, а отвечать клиенту и заводить запрос менеджеру — один раз.
+ */
+const seenMediaGroups = new Map<string, number>();
+const MEDIA_GROUP_TTL_MS = 60_000;
 
-  log.info('голосовое распознано', {
-    threadId: thread.id,
-    model: result.model,
-    durationSec: Math.round(result.durationSec),
-    chars: result.text.length,
-  });
-  return result.text;
+function isFirstInMediaGroup(groupId: string | undefined): boolean {
+  if (!groupId) return true;
+  const now = Date.now();
+  for (const [id, at] of seenMediaGroups) if (now - at > MEDIA_GROUP_TTL_MS) seenMediaGroups.delete(id);
+  if (seenMediaGroups.has(groupId)) return false;
+  seenMediaGroups.set(groupId, now);
+  return true;
 }
 
 /**
- * Картинка в сообщении: либо сжатое фото (берём самый крупный вариант),
- * либо изображение, отправленное файлом «без сжатия».
+ * Сообщение, которое бот прочитать не может: вложение или сообщение без текста.
+ * Раньше клиент получал отписку «понимаю только текст», а менеджер — строчку в топике
+ * без самого файла, и заявка терялась. Теперь файл уходит в топик как есть,
+ * факт пишется в историю, а диалог переводится на менеджера.
  */
-function imageOf(message: tg.TgMessage): { fileId: string; mimeType: string; fileSize?: number } | null {
-  const photo = message.photo?.length ? message.photo[message.photo.length - 1] : null;
-  if (photo) return { fileId: photo.file_id, mimeType: 'image/jpeg', fileSize: photo.file_size };
+async function handleUnreadableMessage(
+  thread: Thread,
+  message: tg.TgMessage,
+  attachment: AttachmentKind | null,
+): Promise<void> {
+  const caption = textOf(message);
+  const name = attachment?.name ?? 'вложение';
+  const needsManager = attachment?.needsManager ?? true;
+  const marker = `[${name}]`;
+  const first = isFirstInMediaGroup(message.media_group_id);
+  // топика может не быть (не создался) — тогда копия уйдёт в General, но не пропадёт
+  const mirror = { messageThreadId: thread.topic_id, ctx: { threadId: thread.id } };
 
-  const doc = message.document;
-  if (doc?.mime_type && /^image\/(jpeg|png|webp|heic|heif)$/i.test(doc.mime_type)) {
-    return { fileId: doc.file_id, mimeType: doc.mime_type.toLowerCase(), fileSize: doc.file_size };
+  if (first) {
+    await db.insertMessage({
+      thread_id: thread.id,
+      role: 'customer',
+      text: caption ? `${caption}\n${marker}` : marker,
+      tg_message_id: message.message_id,
+      meta: { attachment: name, mediaGroupId: message.media_group_id ?? null },
+    });
+    await db.updateThread(thread.id, {
+      ...(needsManager ? { mode: 'human' as const } : {}),
+      last_message_at: new Date().toISOString(),
+      last_message_text: caption ? `${caption} ${marker}` : marker,
+    });
+
+    const header = needsManager
+      ? `👤 Клиент прислал ${name} — бот такое не читает, дальше отвечает менеджер.`
+      : `👤 Клиент прислал ${name}.`;
+    await tg
+      .sendMessage(config.telegram.managerChatId, header, mirror)
+      .catch((err) => log.warn('не удалось предупредить менеджера о вложении', errorMessage(err)));
   }
-  return null;
+
+  // копия нужна для каждого файла: у альбома каждое фото приходит отдельным апдейтом
+  const copied = await tg
+    .copyMessage(config.telegram.managerChatId, thread.customer_chat_id, message.message_id, mirror)
+    .catch((err) => {
+      log.warn('не удалось переслать вложение менеджеру', errorMessage(err));
+      return null;
+    });
+  if (!copied) {
+    await tg
+      .sendMessage(config.telegram.managerChatId, '⚠️ Вложение переслать не удалось — откройте диалог с клиентом.', mirror)
+      .catch(() => undefined);
+  }
+
+  if (!needsManager || !first) return;
+
+  // прогон по прошлым сообщениям уже не нужен: диалог ведёт человек
+  cancelActive(thread.id, 'клиент прислал вложение');
+  await db.insertEscalation({
+    thread_id: thread.id,
+    run_id: null,
+    reason: 'attachment_received',
+    summary: `Клиент прислал ${name}${caption ? ` с подписью: ${caption}` : ''} — бот такое не читает, нужен менеджер.`,
+    context: { attachment: name, caption, tgMessageId: message.message_id },
+  });
+
+  await tg
+    .sendMessage(thread.customer_chat_id, `Я пока не открываю вложения — передал ${name} менеджеру, он ответит здесь же.`, {
+      ctx: { threadId: thread.id },
+    })
+    .catch((err) => log.warn('не удалось ответить клиенту на вложение', errorMessage(err)));
 }
 
 /** Сообщение от клиента в личке бота */
 export async function handleCustomerMessage(message: tg.TgMessage): Promise<void> {
   const thread = await ensureThread(message);
-  let text = textOf(message);
-  let meta: Record<string, unknown> | undefined;
-  let mirrorPrefix = '👤 Клиент';
+  const text = textOf(message);
+  const attachment = attachmentOf(message);
 
-  // голосовое без подписи — распознаём и дальше ведём как обычный текст
-  if (!text && message.voice && transcribeReadiness().ok) {
-    const stamp = formatDuration(message.voice.duration);
-    try {
-      text = await transcribeVoiceMessage(message.voice, thread);
-      meta = { source: 'voice', duration_sec: message.voice.duration, file_unique_id: message.voice.file_unique_id };
-      mirrorPrefix = `🎤 Клиент (голосовое ${stamp})`;
-    } catch (err) {
-      const reason = errorMessage(err);
-      log.warn('не удалось распознать голосовое', { threadId: thread.id, error: reason });
-      if (thread.topic_id != null) {
-        await tg
-          .sendMessage(config.telegram.managerChatId, `🎤 Клиент прислал голосовое ${stamp}, распознать не удалось: ${reason}. Нужен ответ менеджера.`, {
-            messageThreadId: thread.topic_id,
-            ctx: { threadId: thread.id },
-          })
-          .catch(() => undefined);
-      }
-      await tg
-        .sendMessage(thread.customer_chat_id, 'Не получилось разобрать голосовое сообщение. Напишите, пожалуйста, текстом — или дождитесь менеджера.', {
-          ctx: { threadId: thread.id },
-        })
-        .catch(() => undefined);
-      return;
-    }
-  }
-
-  // фото автомобиля — распознаём и добавляем блоком к подписи клиента
-  const image = imageOf(message);
-  if (image && visionReadiness().ok) {
-    try {
-      if (image.fileSize != null && image.fileSize > config.vision.maxFileBytes) {
-        throw new Error(`файл больше ${config.vision.maxFileBytes} байт`);
-      }
-      const bytes = await fetchFile(image.fileId, thread, config.vision.maxFileBytes);
-      const photo = await describeCarPhoto(bytes, image.mimeType, { threadId: thread.id });
-      text = [text, photoToPromptText(photo)].filter(Boolean).join('\n');
-      meta = { source: 'photo', vision: photo };
-      mirrorPrefix = `🖼 Клиент (фото — ${photoSummary(photo)})`;
-    } catch (err) {
-      const reason = errorMessage(err);
-      log.warn('не удалось распознать фото', { threadId: thread.id, error: reason });
-      if (thread.topic_id != null) {
-        await tg
-          .sendMessage(config.telegram.managerChatId, `🖼 Клиент прислал фото, распознать не удалось: ${reason}.`, {
-            messageThreadId: thread.topic_id,
-            ctx: { threadId: thread.id },
-          })
-          .catch(() => undefined);
-      }
-      // с подписью диалог продолжается по тексту, без подписи — зовём менеджера
-      if (!text) {
-        await tg
-          .sendMessage(thread.customer_chat_id, 'Не получилось разобрать фото. Напишите, пожалуйста, марку, модель и год автомобиля — или дождитесь менеджера.', {
-            ctx: { threadId: thread.id },
-          })
-          .catch(() => undefined);
-        return;
-      }
-    }
-  }
-
-  if (!text) {
-    if (thread.topic_id != null) {
-      const kind = message.voice ? `голосовое ${formatDuration(message.voice.duration)}` : 'вложение';
-      await tg
-        .sendMessage(config.telegram.managerChatId, `👤 Клиент прислал ${kind} без текста — нужен ответ менеджера.`, {
-          messageThreadId: thread.topic_id,
-          ctx: { threadId: thread.id },
-        })
-        .catch(() => undefined);
-    }
-    await tg
-      .sendMessage(
-        thread.customer_chat_id,
-        [
-          'Я пока понимаю',
-          [
-            'текст',
-            transcribeReadiness().ok ? 'голосовые' : null,
-            visionReadiness().ok ? 'фото автомобиля' : null,
-          ]
-            .filter(Boolean)
-            .join(', '),
-          '— опишите, пожалуйста, запрос сообщением.',
-        ].join(' '),
-        { ctx: { threadId: thread.id } },
-      )
-      .catch(() => undefined);
+  // фото с подписью тоже сюда: подпись бот прочитает, а картинку — нет,
+  // и отвечать по половине заявки хуже, чем отдать её менеджеру
+  if (attachment || !text) {
+    await handleUnreadableMessage(thread, message, attachment);
     return;
   }
 

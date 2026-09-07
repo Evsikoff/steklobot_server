@@ -1,6 +1,8 @@
 import type { Escalate, LlmAnswer, PriceRow } from '../types.js';
 
 const TYPE_NAMES: Record<string, string> = { Front: 'лобовое', Rear: 'заднее', Side: 'боковое' };
+/** порядок блоков в ответе, чтобы «лобовое и заднее» всегда шло в одном и том же порядке */
+const TYPE_ORDER = ['Front', 'Rear', 'Side'];
 const FEATURE_NAMES: Record<string, string> = {
   None: 'без доп. опций',
   'Rain sensor': 'датчик дождя',
@@ -10,13 +12,192 @@ const FEATURE_NAMES: Record<string, string> = {
   Solar: 'солнцезащитное',
 };
 
+/** Что даёт опция — для ответа на «в чём разница»: объясняем строго то, что есть в прайсе */
+const FEATURE_DETAILS: Record<string, string> = {
+  None: 'без дополнительных опций',
+  'Rain sensor': 'датчик дождя: есть площадка под датчик, дворники включаются сами',
+  Heating: 'обогрев: нити подогрева, стекло быстрее оттаивает и не потеет',
+  Camera: 'камера: есть площадка под камеру систем помощи водителю',
+  HUD: 'HUD: есть зона под проекционный дисплей',
+  Solar: 'солнцезащитное: тонирующее напыление, меньше нагрева и бликов',
+};
+
+/** сколько вариантов одного типа стекла показываем, не спрашивая комплектацию */
+const MAX_VARIANTS_PER_TYPE = 5;
+
 const money = (value: number) => Number(value).toLocaleString('ru-RU') + ' ₽';
 const typeName = (value: string) => TYPE_NAMES[value] ?? value;
-const featureNames = (value: string) =>
+const splitFeatures = (value: string) =>
   String(value || 'None')
     .split(',')
-    .map((item) => FEATURE_NAMES[item.trim()] ?? item.trim())
+    .map((item) => item.trim())
+    .filter(Boolean);
+const featureNames = (value: string) =>
+  splitFeatures(value)
+    .map((item) => FEATURE_NAMES[item] ?? item)
     .join(', ');
+const featureDetails = (value: string) =>
+  splitFeatures(value)
+    .map((item) => FEATURE_DETAILS[item] ?? FEATURE_NAMES[item] ?? item)
+    .join('; ');
+
+const rowTotal = (row: PriceRow) => Number(row.price_glass) + Number(row.price_work);
+const inStock = (row: PriceRow) => String(row.in_stock).toLowerCase() === 'yes';
+
+const plural = (count: number, one: string, few: string, many: string) => {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few;
+  return many;
+};
+
+const capitalize = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
+
+/**
+ * Тексты, которыми предупреждаем клиента, что дальше отвечает человек.
+ * Без них клиент видит только ответ модели (а в ветке с ценами — один прайс)
+ * и не понимает, что тред уже переведён в ручной режим и нужно подождать.
+ */
+const HANDOFF_NOTICES: Record<string, string> = {
+  deal_ready: 'Передаю заявку менеджеру — он свяжется с вами здесь, подтвердит наличие и запишет на замену.',
+  not_in_stock: 'Подключаю менеджера — он подберёт альтернативы и ответит вам здесь же.',
+  repeat_question: 'Подключаю менеджера — он подробно расскажет про варианты и поможет выбрать.',
+};
+const DEFAULT_HANDOFF_NOTICE = 'Подключаю менеджера — он ответит вам здесь же.';
+
+/** уже сказали про менеджера — второй раз не повторяем */
+const mentionsHandoff = (reply: string) => /менеджер/i.test(reply);
+
+function withHandoffNotice(reply: string, escalate: Escalate | null): string {
+  if (!escalate || mentionsHandoff(reply)) return reply;
+  const notice = HANDOFF_NOTICES[escalate.reason] ?? DEFAULT_HANDOFF_NOTICE;
+  return reply ? [reply, notice].join('\n') : notice;
+}
+
+/** Строки одного типа стекла для одной машины — отдельный блок в ответе */
+interface TypeGroup {
+  make: string;
+  model: string;
+  glassType: string;
+  rows: PriceRow[];
+}
+
+/**
+ * Клиент часто спрашивает про несколько стёкол сразу («лобовое и заднее»).
+ * Без разбиения по типу все строки печатались под заголовком первой из них,
+ * и понять, где какое стекло, было невозможно.
+ */
+function groupByType(rows: PriceRow[]): TypeGroup[] {
+  const groups = new Map<string, TypeGroup>();
+  for (const row of rows) {
+    const key = `${row.make}|${row.model}|${row.glass_type}`.toLowerCase();
+    const group = groups.get(key);
+    if (group) group.rows.push(row);
+    else groups.set(key, { make: row.make, model: row.model, glassType: row.glass_type, rows: [row] });
+  }
+  const order = (group: TypeGroup) => {
+    const index = TYPE_ORDER.indexOf(group.glassType);
+    return index === -1 ? TYPE_ORDER.length : index;
+  };
+  return [...groups.values()].sort(
+    (a, b) => order(a) - order(b) || `${a.make} ${a.model}`.localeCompare(`${b.make} ${b.model}`, 'ru'),
+  );
+}
+
+/**
+ * Запрос «самые дешёвые»: из каждого блока берём самый дешёвый вариант и,
+ * если его нет в наличии, ещё и самый дешёвый из имеющихся — иначе клиент
+ * получает только отсутствующие позиции и уходит к менеджеру ни с чем.
+ * Сортировку и суммы считает сервер: цифры модели тут не участвуют.
+ */
+function pickCheapest(rows: PriceRow[]): { rows: PriceRow[]; labels: Map<string, string> } {
+  const sorted = [...rows].sort((a, b) => rowTotal(a) - rowTotal(b));
+  const cheapest = sorted[0];
+  const cheapestInStock = sorted.find(inStock);
+  const labels = new Map<string, string>([[cheapest.id, 'Самый дешёвый']]);
+  if (!cheapestInStock || cheapestInStock.id === cheapest.id) return { rows: [cheapest], labels };
+  labels.set(cheapestInStock.id, 'Самый дешёвый в наличии');
+  return { rows: [cheapest, cheapestInStock], labels };
+}
+
+function renderRow(row: PriceRow, prefix: string): string {
+  const availability = inStock(row) ? 'в наличии' : 'нет в наличии';
+  return (
+    prefix +
+    `${row.brand}, ${featureNames(row.features)}, ${row.year_from}–${row.year_to}: ` +
+    `стекло ${money(row.price_glass)} + установка ${money(row.price_work)} = ${money(rowTotal(row))}; ${availability}.`
+  );
+}
+
+/** Текст с ценами: один блок на каждый тип стекла, внутри — варианты */
+function renderOffer(groups: TypeGroup[], labels: Map<string, string>): string {
+  const first = groups[0];
+  const sameCar = groups.every((group) => group.make === first.make && group.model === first.model);
+  const rowPrefix = (row: PriceRow, index: number, total: number) => {
+    const label = labels.get(row.id);
+    if (label) return `${label} — `;
+    return total > 1 ? `${index + 1}. ` : '';
+  };
+
+  const renderRows = (group: TypeGroup) =>
+    group.rows.map((row, index) => renderRow(row, rowPrefix(row, index, group.rows.length)));
+
+  // один тип стекла — марка и тип уходят в шапку, отдельный подзаголовок не нужен
+  if (groups.length === 1) {
+    const single = first.rows.length;
+    const header =
+      single === 1
+        ? `По прайсу для ${first.make} ${first.model}, ${typeName(first.glassType)} стекло:`
+        : `Для ${first.make} ${first.model}, ${typeName(first.glassType)} стекло, нашёл ${single} ${plural(single, 'вариант', 'варианта', 'вариантов')}:`;
+    return [header, ...renderRows(first)].join('\n');
+  }
+
+  const blocks = groups.map((group) => {
+    const car = sameCar ? '' : ` (${group.make} ${group.model})`;
+    const header = `${capitalize(typeName(group.glassType))} стекло${car}:`;
+    return [header, ...renderRows(group)].join('\n');
+  });
+
+  const count = groups.reduce((sum, group) => sum + group.rows.length, 0);
+  const heading = sameCar
+    ? `Для ${first.make} ${first.model} нашёл ${count} ${plural(count, 'вариант', 'варианта', 'вариантов')}:`
+    : `Нашёл ${count} ${plural(count, 'вариант', 'варианта', 'вариантов')}:`;
+  return [heading, ...blocks].join('\n\n');
+}
+
+/**
+ * Ответ на вопрос про уже показанные варианты («в чём разница?»): цены не повторяем,
+ * объясняем то, чем строки прайса реально отличаются друг от друга — бренд и опции.
+ * Нумерация совпадает с предыдущим сообщением, чтобы клиент сопоставил их глазами.
+ */
+function renderDifferences(groups: TypeGroup[]): string {
+  const renderRows = (group: TypeGroup) =>
+    group.rows.map((row, index) => {
+      const prefix = group.rows.length > 1 ? `${index + 1}. ` : '';
+      return `${prefix}${row.brand} — ${featureDetails(row.features)}.`;
+    });
+
+  const blocks =
+    groups.length === 1
+      ? renderRows(groups[0]).join('\n')
+      : groups
+          .map((group) => [`${capitalize(typeName(group.glassType))} стекло:`, ...renderRows(group)].join('\n'))
+          .join('\n\n');
+
+  return [
+    'Варианты отличаются производителем стекла и набором опций:',
+    blocks,
+    'Цены и наличие — в сообщении выше. Скажите, какой вариант берём, и я передам заявку менеджеру.',
+  ].join('\n\n');
+}
+
+/** тот же набор строк, что уже показали клиенту в прошлом ответе */
+const isSameOffer = (rows: PriceRow[], offeredIds: string[]) =>
+  rows.length > 0 && rows.length === offeredIds.length && rows.every((row) => offeredIds.includes(row.id));
+
+/** клиент прямо просит показать список заново — тогда повтор цен уместен */
+const asksToRepeat = (text: string) => /повтор|ещё раз|еще раз|снова|заново|напомн/i.test(text);
 
 export interface ComposeInput {
   answer: LlmAnswer;
@@ -24,6 +205,8 @@ export interface ComposeInput {
   priceListAvailable: boolean;
   /** текст(ы) клиента — попадает в summary эскалации */
   incomingText: string;
+  /** предыдущий ответ бота: показанные строки и их текст — чтобы не отправить то же самое второй раз */
+  lastOffer: { ids: string[]; text: string };
 }
 
 export interface ComposeResult {
@@ -56,6 +239,17 @@ export function composeReply(input: ComposeInput): ComposeResult {
       .map((id) => priceRows.find((row) => String(row.id) === id))
       .filter((row): row is PriceRow => Boolean(row));
 
+    let groups = groupByType(matchedRows);
+    const labels = new Map<string, string>();
+    if (answer.selection === 'cheapest' && groups.length) {
+      groups = groups.map((group) => {
+        const picked = pickCheapest(group.rows);
+        picked.labels.forEach((label, id) => labels.set(id, label));
+        return { ...group, rows: picked.rows };
+      });
+      matchedRows = groups.flatMap((group) => group.rows);
+    }
+
     if (!matchedRows.length) {
       lookupStatus = 'not_found';
       reply = 'Извините, я не нашёл подходящую цену в прайс-листе. Подключаю менеджера — он уточнит стоимость.';
@@ -63,38 +257,53 @@ export function composeReply(input: ComposeInput): ComposeResult {
         reason: 'price_not_found',
         summary: 'Модель указала несуществующие id строк прайса для запроса: ' + input.incomingText,
       };
-    } else if (matchedRows.length > 5) {
+    } else if (groups.some((group) => group.rows.length > MAX_VARIANTS_PER_TYPE)) {
       lookupStatus = 'need_details';
       matchedRows = [];
       reply =
         'Нашлось много вариантов. Уточните, пожалуйста, комплектацию стекла: наличие датчика дождя, обогрева, камеры или HUD.';
       escalate = null;
+    } else if (isSameOffer(matchedRows, input.lastOffer.ids) && !asksToRepeat(input.incomingText)) {
+      // Клиент спросил про уже показанные варианты («в чём разница?»), а модель снова
+      // вернула те же строки. Прислать тот же прайс — не ответ: объясняем отличия.
+      if (escalate && ['price_not_found', 'price_source_unavailable'].includes(escalate.reason)) escalate = null;
+      // порядок берём из показанного списка, иначе нумерация разъедется
+      matchedRows = [...matchedRows].sort(
+        (a, b) => input.lastOffer.ids.indexOf(a.id) - input.lastOffer.ids.indexOf(b.id),
+      );
+      reply = renderDifferences(groupByType(matchedRows));
+
+      // отличия уже объясняли этим же текстом, а вопрос повторяется — дальше нужен человек
+      if (reply === input.lastOffer.text) {
+        reply = '';
+        escalate = escalate ?? {
+          reason: 'repeat_question',
+          summary: 'Клиент повторно спрашивает про уже показанные варианты: ' + input.incomingText,
+        };
+      }
     } else {
       if (escalate && ['price_not_found', 'price_source_unavailable'].includes(escalate.reason)) escalate = null;
-      const lines = matchedRows.map((row, index) => {
-        const total = Number(row.price_glass) + Number(row.price_work);
-        const availability = String(row.in_stock).toLowerCase() === 'yes' ? 'в наличии' : 'нет в наличии';
-        return (
-          (matchedRows.length > 1 ? `${index + 1}. ` : '') +
-          `${row.brand}, ${featureNames(row.features)}, ${row.year_from}–${row.year_to}: ` +
-          `стекло ${money(row.price_glass)} + установка ${money(row.price_work)} = ${money(total)}; ${availability}.`
-        );
-      });
-      const first = matchedRows[0];
-      const heading =
-        matchedRows.length > 1
-          ? `Для ${first.make} ${first.model}, ${typeName(first.glass_type)} стекло, нашёл ${matchedRows.length} варианта:`
-          : `По прайсу для ${first.make} ${first.model}, ${typeName(first.glass_type)} стекло:`;
-      reply = heading + '\n' + lines.join('\n');
+      reply = renderOffer(groups, labels);
 
-      const availableCount = matchedRows.filter((row) => String(row.in_stock).toLowerCase() === 'yes').length;
-      if (availableCount === 0 && !escalate) {
+      // наличие проверяем по каждому типу стекла отдельно: лобовое может быть
+      // в наличии, а заднее — нет, и клиенту важно знать, чего именно ждать
+      const emptyGroups = groups.filter((group) => !group.rows.some(inStock));
+      if (emptyGroups.length && !escalate) {
+        const emptyIds = emptyGroups.flatMap((group) => group.rows.map((row) => row.id));
+        const emptyTypes = emptyGroups.map((group) => `${typeName(group.glassType)} стекло`).join(', ');
         escalate = {
           reason: 'not_in_stock',
           summary:
-            'Все найденные позиции (' + matchedRows.map((row) => row.id).join(', ') + ') отсутствуют в наличии; нужны альтернативы.',
+            (emptyGroups.length === groups.length
+              ? `Все показанные позиции (${emptyIds.join(', ')}) отсутствуют в наличии`
+              : `Нет в наличии по типам: ${emptyTypes} — позиции ${emptyIds.join(', ')}`) + '; нужны альтернативы.',
         };
-        reply += '\nСейчас эти позиции отмечены как отсутствующие. Подключаю менеджера, чтобы проверить альтернативы.';
+        reply +=
+          '\n\n' +
+          (emptyGroups.length === groups.length
+            ? 'Сейчас эти позиции отмечены как отсутствующие. Подключаю менеджера, чтобы проверить альтернативы.'
+            : `Нет в наличии: ${emptyGroups.map((group) => typeName(group.glassType) + ' стекло').join(', ')}. ` +
+              'Подключаю менеджера, чтобы проверить альтернативы.');
       }
     }
   } else if (lookupStatus === 'not_found') {
@@ -103,6 +312,9 @@ export function composeReply(input: ComposeInput): ComposeResult {
   } else if (lookupStatus === 'need_details' && !reply) {
     reply = 'Уточните, пожалуйста, марку, модель, год автомобиля и какое стекло требуется: лобовое, заднее или боковое?';
   }
+
+  // тред уходит в ручной режим — клиент должен знать, что ждёт менеджера
+  reply = withHandoffNotice(reply, escalate);
 
   if (!reply) reply = 'Чем могу помочь с подбором автостекла?';
 
