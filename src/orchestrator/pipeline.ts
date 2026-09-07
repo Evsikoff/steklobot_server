@@ -158,6 +158,7 @@ export async function executeRun(params: {
           attempt: attempts,
           lookupStatus: validated.value.lookupStatus,
           matchedPriceIds: validated.value.matchedPriceIds,
+          selection: validated.value.selection,
         });
         answer = validated;
         break;

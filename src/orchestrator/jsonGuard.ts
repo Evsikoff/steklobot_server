@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { LlmAnswer } from '../types.js';
+import type { LlmAnswer, PriceSelection } from '../types.js';
 
 const escalateSchema = z
   .object({
@@ -12,8 +12,16 @@ const answerSchema = z.object({
   reply: z.string().default(''),
   lookupStatus: z.enum(['not_requested', 'need_details', 'found', 'found_multiple', 'not_found']),
   matchedPriceIds: z.array(z.union([z.string(), z.number()])).default([]),
+  // значение нормализуем сами: неожиданное слово не должно ронять весь ответ
+  selection: z.union([z.string(), z.null()]).optional(),
   escalate: escalateSchema.default(null),
 });
+
+/** "cheapest", "Cheapest in stock", "самый дешёвый" → cheapest; всё прочее → all */
+function normalizeSelection(raw: unknown): PriceSelection {
+  const value = String(raw ?? '').toLowerCase();
+  return value.includes('cheap') || value.includes('дешев') || value.includes('дешёв') ? 'cheapest' : 'all';
+}
 
 export type ValidationResult =
   | { ok: true; value: LlmAnswer }
@@ -88,6 +96,7 @@ export function validateLlmJson(raw: string): ValidationResult {
       reply: result.data.reply.trim(),
       lookupStatus: result.data.lookupStatus,
       matchedPriceIds: ids,
+      selection: normalizeSelection(result.data.selection),
       escalate: result.data.escalate,
     },
   };
