@@ -443,6 +443,7 @@ const REASON_LABELS = {
   price_not_found: 'Цена не найдена в прайсе',
   not_in_stock: 'Позиции отсутствуют в наличии',
   repeat_question: 'Клиент переспрашивает про показанные варианты',
+  attachment_received: 'Клиент прислал вложение',
   ai_unavailable: 'LLM не ответила корректно',
   price_source_unavailable: 'Прайс недоступен',
   pipeline_error: 'Техническая ошибка обработки',

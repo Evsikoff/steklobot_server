@@ -43,6 +43,18 @@ export interface TgMessage {
   caption?: string;
   chat: { id: number; type: string; title?: string; first_name?: string; last_name?: string; username?: string };
   from?: { id: number; is_bot: boolean; first_name?: string; last_name?: string; username?: string };
+  // вложения: содержимое нам не нужно — важен сам факт и тип, файл уходит менеджеру через copyMessage
+  photo?: unknown[];
+  voice?: unknown;
+  audio?: unknown;
+  video?: unknown;
+  video_note?: unknown;
+  document?: unknown;
+  animation?: unknown;
+  sticker?: unknown;
+  location?: unknown;
+  contact?: unknown;
+  media_group_id?: string;
 }
 
 export interface TgUpdate {
@@ -63,6 +75,26 @@ export async function sendMessage(
   };
   if (opts.messageThreadId != null) payload.message_thread_id = opts.messageThreadId;
   return call<TgMessage>('sendMessage', payload, opts.ctx ?? {});
+}
+
+/**
+ * Копия сообщения клиента в чат менеджеров: фото, голосовое или файл долетают
+ * как есть, вместе с подписью. Пересылаем именно copyMessage, а не forwardMessage,
+ * чтобы в топике не светилась пометка «переслано от» с личным профилем клиента.
+ */
+export async function copyMessage(
+  chatId: string | number,
+  fromChatId: string | number,
+  messageId: number,
+  opts: { messageThreadId?: number | null; ctx?: CallCtx } = {},
+): Promise<{ message_id: number }> {
+  const payload: Record<string, unknown> = {
+    chat_id: String(chatId),
+    from_chat_id: String(fromChatId),
+    message_id: messageId,
+  };
+  if (opts.messageThreadId != null) payload.message_thread_id = opts.messageThreadId;
+  return call<{ message_id: number }>('copyMessage', payload, opts.ctx ?? {});
 }
 
 export async function createForumTopic(name: string, ctx: CallCtx = {}): Promise<{ message_thread_id: number }> {
