@@ -117,13 +117,13 @@ export const config = {
   },
 
   /**
-   * Распознавание голосовых сообщений клиента — файловая Gemini 3.5 Transcribe.
-   * Ключ тот же, что и у обычного Gemini: GEMINI_API_KEY. Работает независимо
-   * от выбранного провайдера LLM.
+   * Распознавание голосовых сообщений клиента — мультимодальная Gemini.
+   * По умолчанию используется уже проверенная на фото GEMINI_MODEL; короткие
+   * записи передаются inline, большие — через Files API.
    */
   transcribe: {
     enabled: optional('TRANSCRIBE_ENABLED', '1') !== '0',
-    model: optional('TRANSCRIBE_MODEL', 'gemini-3.5-transcribe'),
+    model: optional('TRANSCRIBE_MODEL', optional('GEMINI_MODEL', 'gemini-3.7-flash')),
     /** подсказка по языку (BCP-47). Пустое значение — автоопределение модели */
     languageCodes: strList('TRANSCRIBE_LANGUAGE_CODES', ['ru-RU']),
     /** голосовые длиннее лимита сразу отдаём менеджеру */
@@ -132,6 +132,9 @@ export const config = {
     maxFileBytes: num('TRANSCRIBE_MAX_FILE_BYTES', 20 * 1024 * 1024),
     /** общий бюджет на распознавание одного сообщения */
     timeoutMs: num('TRANSCRIBE_TIMEOUT_MS', 60_000),
+    /** base64 увеличивает тело на треть; оставляем запас до лимита inline-запроса 20 МБ */
+    inlineMaxFileBytes: num('TRANSCRIBE_INLINE_MAX_FILE_BYTES', 14 * 1024 * 1024),
+    maxOutputTokens: num('TRANSCRIBE_MAX_OUTPUT_TOKENS', 4096),
   },
 
   /**

@@ -3,9 +3,9 @@ import { ExternalError, httpJson, sleep, tracked } from './external.js';
 
 /**
  * Telegram уже присылает готовый файл Ogg/Opus. Для записанного голосового
- * Live API не нужен: файл загружается в Gemini Files API и целиком отдаётся
- * специализированной модели Gemini Transcribe. Так мы не перекодируем звук,
- * не угадываем конец фразы по событиям WebSocket и не теряем хвост записи.
+ * Live API не нужен: короткий файл передаётся inline той же мультимодальной
+ * модели, которая распознаёт фото. Для больших файлов остаётся Files API.
+ * Так голос не зависит от доступности отдельной модели Transcribe.
  */
 
 export interface TranscribeCtx {
@@ -41,8 +41,12 @@ const apiBase = () => config.llm.apiBase.replace(/\/+$/, '');
 
 export function transcribeModel(): string {
   const configured = config.transcribe.model.replace(/^models\//, '');
-  // Совместимость с уже созданными Secret groups: прежнее значение было Live-моделью.
-  return configured === 'gemini-3.5-transcribe-live' ? 'gemini-3.5-transcribe' : configured;
+  // Старые значения могли остаться в Secret group. На этих моделях голос уже
+  // не заработал, поэтому прозрачно используем проверенную GEMINI_MODEL.
+  if (configured === 'gemini-3.5-transcribe-live' || configured === 'gemini-3.5-transcribe') {
+    return config.llm.model.replace(/^models\//, '');
+  }
+  return configured;
 }
 
 /** Готовность распознавания: тот же ключ, что и у Gemini */
@@ -189,46 +193,24 @@ async function waitForFile(file: GeminiFile, model: string, deadline: number, ct
   return current;
 }
 
-async function generateTranscript(
-  file: GeminiFile,
-  mimeType: string,
+function transcriptionPrompt(): string {
+  const languages = config.transcribe.languageCodes.length
+    ? `Основные языки записи: ${config.transcribe.languageCodes.join(', ')}. `
+    : '';
+  return (
+    'Точно расшифруй голосовое сообщение клиента. ' +
+    languages +
+    'Верни только произнесённый текст без кавычек, пояснений, ответа клиенту и описания звуков. ' +
+    'Сохрани марки автомобилей, модели, годы, номера вариантов и типы стёкол.'
+  );
+}
+
+async function parseTranscript(
+  response: Awaited<ReturnType<typeof httpJson>>,
+  operation: string,
   model: string,
-  deadline: number,
   ctx: TranscribeCtx,
 ): Promise<{ text: string; usage: Record<string, unknown> | null }> {
-  const operation = `transcribe:${model}`;
-  const payload = {
-    contents: [
-      {
-        role: 'user',
-        parts: [{ fileData: { fileUri: file.uri, mimeType: file.mimeType || mimeType } }],
-      },
-    ],
-    generationConfig: {
-      audioTranscriptionConfig: {
-        languageCodes: config.transcribe.languageCodes,
-        mode: 'SMART',
-      },
-    },
-  };
-  const response = await httpJson(
-    {
-      service: 'gemini',
-      operation,
-      threadId: ctx.threadId,
-      runId: ctx.runId,
-      request: { model, file: file.name, mimeType: file.mimeType || mimeType },
-    },
-    `${apiBase()}/v1beta/models/${model}:generateContent`,
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': config.llm.apiKey },
-      body: JSON.stringify(payload),
-      timeoutMs: remainingMs(deadline, operation),
-    },
-    { retries: 1, retryDelayMs: 800 },
-  );
-
   return tracked(
     {
       service: 'gemini',
@@ -268,6 +250,93 @@ async function generateTranscript(
   );
 }
 
+async function generateInlineTranscript(
+  audio: Uint8Array,
+  mimeType: string,
+  model: string,
+  deadline: number,
+  ctx: TranscribeCtx,
+): Promise<{ text: string; usage: Record<string, unknown> | null }> {
+  const operation = `transcribeInline:${model}`;
+  const payload = {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: transcriptionPrompt() },
+          { inlineData: { mimeType, data: Buffer.from(audio).toString('base64') } },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: config.transcribe.maxOutputTokens,
+    },
+  };
+  const response = await httpJson(
+    {
+      service: 'gemini',
+      operation,
+      threadId: ctx.threadId,
+      runId: ctx.runId,
+      request: { model, mimeType, bytes: audio.byteLength },
+    },
+    `${apiBase()}/v1beta/models/${model}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': config.llm.apiKey },
+      body: JSON.stringify(payload),
+      timeoutMs: remainingMs(deadline, operation),
+    },
+    { retries: 1, retryDelayMs: 800 },
+  );
+  return parseTranscript(response, operation, model, ctx);
+}
+
+async function generateFileTranscript(
+  file: GeminiFile,
+  mimeType: string,
+  model: string,
+  deadline: number,
+  ctx: TranscribeCtx,
+): Promise<{ text: string; usage: Record<string, unknown> | null }> {
+  const operation = `transcribe:${model}`;
+  const payload = {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: transcriptionPrompt() },
+          { fileData: { fileUri: file.uri, mimeType: file.mimeType || mimeType } },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: config.transcribe.maxOutputTokens,
+    },
+  };
+  const response = await httpJson(
+    {
+      service: 'gemini',
+      operation,
+      threadId: ctx.threadId,
+      runId: ctx.runId,
+      request: { model, file: file.name, mimeType: file.mimeType || mimeType },
+    },
+    `${apiBase()}/v1beta/models/${model}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': config.llm.apiKey },
+      body: JSON.stringify(payload),
+      timeoutMs: remainingMs(deadline, operation),
+    },
+    { retries: 1, retryDelayMs: 800 },
+  );
+
+  return parseTranscript(response, operation, model, ctx);
+}
+
 async function deleteFile(name: string, model: string, ctx: TranscribeCtx): Promise<void> {
   await httpJson(
     {
@@ -287,7 +356,7 @@ async function deleteFile(name: string, model: string, ctx: TranscribeCtx): Prom
   );
 }
 
-/** Ogg/Opus из Telegram → Files API → Gemini Transcribe → текст. */
+/** Ogg/Opus из Telegram → inline Gemini (с Files API как резервом) → текст. */
 export async function transcribeVoice(audio: Uint8Array, ctx: TranscribeCtx = {}): Promise<TranscribeResult> {
   const ready = transcribeReadiness();
   if (!ready.ok) throw new ExternalError('gemini', 'transcribe', `Распознавание недоступно: ${ready.reason}`);
@@ -298,10 +367,25 @@ export async function transcribeVoice(audio: Uint8Array, ctx: TranscribeCtx = {}
   let file: GeminiFile | null = null;
 
   try {
+    if (audio.byteLength <= config.transcribe.inlineMaxFileBytes) {
+      try {
+        const result = await generateInlineTranscript(audio, mimeType, model, deadline, ctx);
+        return {
+          text: result.text,
+          model,
+          durationSec: ctx.durationSec ?? 0,
+          usage: result.usage,
+        };
+      } catch {
+        // Inline — основной быстрый путь. При отказе пробуем тот же файл через Files API;
+        // первая причина уже сохранена в журнале external_events.
+      }
+    }
+
     const uploadUrl = await startUpload(audio.byteLength, mimeType, model, deadline, ctx);
     file = await uploadAudio(audio, mimeType, model, uploadUrl, deadline, ctx);
     file = await waitForFile(file, model, deadline, ctx);
-    const result = await generateTranscript(file, mimeType, model, deadline, ctx);
+    const result = await generateFileTranscript(file, mimeType, model, deadline, ctx);
     return {
       text: result.text,
       model,
