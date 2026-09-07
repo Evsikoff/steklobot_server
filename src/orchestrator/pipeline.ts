@@ -93,6 +93,16 @@ export async function executeRun(params: {
       .slice(-config.orchestrator.historyLimit)
       .map((m) => ({ role: m.role, text: m.text }));
 
+    // предыдущий ответ бота: клиент часто спрашивает про уже показанные варианты
+    // («в чём разница?»), и модель, и сервер должны понимать, о чём именно вопрос
+    const lastAssistant = [...allMessages].reverse().find((m) => m.role === 'assistant');
+    const lastOffer = {
+      ids: Array.isArray(lastAssistant?.meta?.matchedPriceIds)
+        ? (lastAssistant.meta.matchedPriceIds as unknown[]).map(String)
+        : [],
+      text: lastAssistant?.text ?? '',
+    };
+
     stageEvent(
       run,
       'context',
@@ -113,6 +123,7 @@ export async function executeRun(params: {
           priceRows: price.rows,
           history,
           incoming: inputs.map((i) => i.text),
+          lastOfferedIds: lastOffer.ids,
         }),
       },
     ];
@@ -190,6 +201,7 @@ export async function executeRun(params: {
         priceRows: price.rows,
         priceListAvailable: price.available,
         incomingText,
+        lastOffer,
       });
     } else {
       composed = fallbackReply(

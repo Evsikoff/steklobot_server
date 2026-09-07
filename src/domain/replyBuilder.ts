@@ -12,16 +12,34 @@ const FEATURE_NAMES: Record<string, string> = {
   Solar: 'солнцезащитное',
 };
 
+/** Что даёт опция — для ответа на «в чём разница»: объясняем строго то, что есть в прайсе */
+const FEATURE_DETAILS: Record<string, string> = {
+  None: 'без дополнительных опций',
+  'Rain sensor': 'датчик дождя: есть площадка под датчик, дворники включаются сами',
+  Heating: 'обогрев: нити подогрева, стекло быстрее оттаивает и не потеет',
+  Camera: 'камера: есть площадка под камеру систем помощи водителю',
+  HUD: 'HUD: есть зона под проекционный дисплей',
+  Solar: 'солнцезащитное: тонирующее напыление, меньше нагрева и бликов',
+};
+
 /** сколько вариантов одного типа стекла показываем, не спрашивая комплектацию */
 const MAX_VARIANTS_PER_TYPE = 5;
 
 const money = (value: number) => Number(value).toLocaleString('ru-RU') + ' ₽';
 const typeName = (value: string) => TYPE_NAMES[value] ?? value;
-const featureNames = (value: string) =>
+const splitFeatures = (value: string) =>
   String(value || 'None')
     .split(',')
-    .map((item) => FEATURE_NAMES[item.trim()] ?? item.trim())
+    .map((item) => item.trim())
+    .filter(Boolean);
+const featureNames = (value: string) =>
+  splitFeatures(value)
+    .map((item) => FEATURE_NAMES[item] ?? item)
     .join(', ');
+const featureDetails = (value: string) =>
+  splitFeatures(value)
+    .map((item) => FEATURE_DETAILS[item] ?? FEATURE_NAMES[item] ?? item)
+    .join('; ');
 
 const rowTotal = (row: PriceRow) => Number(row.price_glass) + Number(row.price_work);
 const inStock = (row: PriceRow) => String(row.in_stock).toLowerCase() === 'yes';
@@ -44,6 +62,7 @@ const capitalize = (value: string) => value.charAt(0).toUpperCase() + value.slic
 const HANDOFF_NOTICES: Record<string, string> = {
   deal_ready: 'Передаю заявку менеджеру — он свяжется с вами здесь, подтвердит наличие и запишет на замену.',
   not_in_stock: 'Подключаю менеджера — он подберёт альтернативы и ответит вам здесь же.',
+  repeat_question: 'Подключаю менеджера — он подробно расскажет про варианты и поможет выбрать.',
 };
 const DEFAULT_HANDOFF_NOTICE = 'Подключаю менеджера — он ответит вам здесь же.';
 
@@ -147,12 +166,47 @@ function renderOffer(groups: TypeGroup[], labels: Map<string, string>): string {
   return [heading, ...blocks].join('\n\n');
 }
 
+/**
+ * Ответ на вопрос про уже показанные варианты («в чём разница?»): цены не повторяем,
+ * объясняем то, чем строки прайса реально отличаются друг от друга — бренд и опции.
+ * Нумерация совпадает с предыдущим сообщением, чтобы клиент сопоставил их глазами.
+ */
+function renderDifferences(groups: TypeGroup[]): string {
+  const renderRows = (group: TypeGroup) =>
+    group.rows.map((row, index) => {
+      const prefix = group.rows.length > 1 ? `${index + 1}. ` : '';
+      return `${prefix}${row.brand} — ${featureDetails(row.features)}.`;
+    });
+
+  const blocks =
+    groups.length === 1
+      ? renderRows(groups[0]).join('\n')
+      : groups
+          .map((group) => [`${capitalize(typeName(group.glassType))} стекло:`, ...renderRows(group)].join('\n'))
+          .join('\n\n');
+
+  return [
+    'Варианты отличаются производителем стекла и набором опций:',
+    blocks,
+    'Цены и наличие — в сообщении выше. Скажите, какой вариант берём, и я передам заявку менеджеру.',
+  ].join('\n\n');
+}
+
+/** тот же набор строк, что уже показали клиенту в прошлом ответе */
+const isSameOffer = (rows: PriceRow[], offeredIds: string[]) =>
+  rows.length > 0 && rows.length === offeredIds.length && rows.every((row) => offeredIds.includes(row.id));
+
+/** клиент прямо просит показать список заново — тогда повтор цен уместен */
+const asksToRepeat = (text: string) => /повтор|ещё раз|еще раз|снова|заново|напомн/i.test(text);
+
 export interface ComposeInput {
   answer: LlmAnswer;
   priceRows: PriceRow[];
   priceListAvailable: boolean;
   /** текст(ы) клиента — попадает в summary эскалации */
   incomingText: string;
+  /** предыдущий ответ бота: показанные строки и их текст — чтобы не отправить то же самое второй раз */
+  lastOffer: { ids: string[]; text: string };
 }
 
 export interface ComposeResult {
@@ -209,6 +263,24 @@ export function composeReply(input: ComposeInput): ComposeResult {
       reply =
         'Нашлось много вариантов. Уточните, пожалуйста, комплектацию стекла: наличие датчика дождя, обогрева, камеры или HUD.';
       escalate = null;
+    } else if (isSameOffer(matchedRows, input.lastOffer.ids) && !asksToRepeat(input.incomingText)) {
+      // Клиент спросил про уже показанные варианты («в чём разница?»), а модель снова
+      // вернула те же строки. Прислать тот же прайс — не ответ: объясняем отличия.
+      if (escalate && ['price_not_found', 'price_source_unavailable'].includes(escalate.reason)) escalate = null;
+      // порядок берём из показанного списка, иначе нумерация разъедется
+      matchedRows = [...matchedRows].sort(
+        (a, b) => input.lastOffer.ids.indexOf(a.id) - input.lastOffer.ids.indexOf(b.id),
+      );
+      reply = renderDifferences(groupByType(matchedRows));
+
+      // отличия уже объясняли этим же текстом, а вопрос повторяется — дальше нужен человек
+      if (reply === input.lastOffer.text) {
+        reply = '';
+        escalate = escalate ?? {
+          reason: 'repeat_question',
+          summary: 'Клиент повторно спрашивает про уже показанные варианты: ' + input.incomingText,
+        };
+      }
     } else {
       if (escalate && ['price_not_found', 'price_source_unavailable'].includes(escalate.reason)) escalate = null;
       reply = renderOffer(groups, labels);
