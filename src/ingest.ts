@@ -4,6 +4,7 @@ import * as tg from './services/telegram.js';
 import { enqueue, cancelActive } from './orchestrator/index.js';
 import { transcribeReadiness, transcribeVoice } from './services/transcribe.js';
 import { describeCarPhoto, photoSummary, photoToPromptText, visionReadiness } from './services/vision.js';
+import { sendCustomerText } from './services/customerMessaging.js';
 import { log, errorMessage } from './logger.js';
 import type { Thread } from './types.js';
 
@@ -187,16 +188,18 @@ async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Re
 
 async function sendQuickRecognitionReply(thread: Thread, recognized: Recognized, recognitionMs: number): Promise<void> {
   try {
-    const sent = await tg.sendMessage(thread.customer_chat_id, recognized.customerReply, { ctx: { threadId: thread.id } });
+    const sent = await sendCustomerText(thread, recognized.customerReply);
     await db.insertMessage({
       thread_id: thread.id,
       role: 'assistant',
       text: recognized.customerReply,
-      tg_message_id: sent.message_id,
+      tg_message_id: sent.telegramMessageId,
       meta: {
         recognitionAck: true,
         source: recognized.meta.source ?? null,
         recognitionMs,
+        channel: sent.channel,
+        providerMessageId: sent.providerMessageId,
       },
     });
     await db.updateThread(thread.id, {
@@ -439,14 +442,14 @@ export async function sendAsManager(
   author: string,
   opts: { mirror?: boolean } = {},
 ): Promise<void> {
-  const sent = await tg.sendMessage(thread.customer_chat_id, text, { ctx: { threadId: thread.id } });
+  const sent = await sendCustomerText(thread, text);
 
   await db.insertMessage({
     thread_id: thread.id,
     role: 'manager',
     text,
-    tg_message_id: sent.message_id,
-    meta: { author },
+    tg_message_id: sent.telegramMessageId,
+    meta: { author, channel: sent.channel, providerMessageId: sent.providerMessageId },
   });
   await db.updateThread(thread.id, { last_message_at: new Date().toISOString(), last_message_text: text });
 

@@ -7,7 +7,9 @@ import { config } from '../config.js';
 import { bus } from '../bus.js';
 import * as db from '../db.js';
 import * as tg from '../services/telegram.js';
+import * as wa from '../services/whatsapp.js';
 import { handleUpdate, sendAsManager } from '../ingest.js';
+import { handleWhatsAppWebhook } from '../whatsappIngest.js';
 import { cancelActive, orchestratorSnapshot } from '../orchestrator/index.js';
 import { invalidatePriceCache, loadPriceList, priceListStatus } from '../services/priceList.js';
 import { activeProvider, applyProvider, getProvider, isProviderId, providersOverview } from '../services/llm/index.js';
@@ -21,7 +23,15 @@ const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 
 export function createServer(): http.Server {
   const app = express();
   app.set('trust proxy', true);
-  app.use(express.json({ limit: '1mb' }));
+  app.use(
+    express.json({
+      limit: '1mb',
+      // Meta подписывает исходные байты тела. Сохраняем их до JSON-разбора.
+      verify: (req, _res, buffer) => {
+        (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer);
+      },
+    }),
+  );
 
   // ------------------------------------------------------------- служебное
   app.get('/healthz', async (_req, res) => {
@@ -42,6 +52,46 @@ export function createServer(): http.Server {
     // Telegram ждёт быстрый 200 — обработку ведём асинхронно
     res.json({ ok: true });
     void handleUpdate(req.body).catch((err) => log.error('ошибка обработки апдейта', errorMessage(err)));
+  });
+
+  // ------------------------------------------------------ WhatsApp webhook
+  // Второй вариант маршрута оставлен для уже скопированного URL с // после домена.
+  const whatsappWebhookPaths = ['/whatsapp/webhook', '//whatsapp/webhook'];
+
+  app.get(whatsappWebhookPaths, (req, res) => {
+    const mode = String(req.query['hub.mode'] ?? '');
+    const token = String(req.query['hub.verify_token'] ?? '');
+    const challenge = String(req.query['hub.challenge'] ?? '');
+
+    if (!config.whatsapp.verifyToken) {
+      res.status(503).send('WHATSAPP_VERIFY_TOKEN is not configured');
+      return;
+    }
+    if (mode !== 'subscribe' || token !== config.whatsapp.verifyToken || !challenge) {
+      res.status(403).send('Webhook verification failed');
+      return;
+    }
+    log.info('callback URL WhatsApp подтверждён');
+    res.status(200).type('text/plain').send(challenge);
+  });
+
+  app.post(whatsappWebhookPaths, (req, res) => {
+    const ready = wa.whatsappReadiness();
+    if (!ready.ok) {
+      res.status(503).json({ error: `WhatsApp не настроен: ${ready.missing.join(', ')}` });
+      return;
+    }
+    const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+    if (!rawBody || !wa.verifyWebhookSignature(rawBody, req.header('x-hub-signature-256'))) {
+      res.status(401).json({ error: 'bad WhatsApp signature' });
+      return;
+    }
+
+    // Cloud API должен быстро получить 200; фото, голос и LLM обрабатываются после ACK.
+    res.json({ ok: true });
+    void handleWhatsAppWebhook(req.body).catch((err) =>
+      log.error('ошибка обработки webhook WhatsApp', errorMessage(err)),
+    );
   });
 
   // ------------------------------------------------------------------ auth
@@ -210,6 +260,21 @@ export function createServer(): http.Server {
       .getMe()
       .then((me) => (checks.telegram = { ok: true, detail: `@${me.username}` }))
       .catch((err) => (checks.telegram = { ok: false, detail: errorMessage(err) }));
+
+    const whatsapp = wa.whatsappReadiness();
+    if (!whatsapp.ok) {
+      checks.whatsapp = { ok: false, detail: `не заданы ${whatsapp.missing.join(', ')}` };
+    } else {
+      await wa
+        .getPhoneNumber()
+        .then((phone) => {
+          checks.whatsapp = {
+            ok: true,
+            detail: [phone.verified_name, phone.display_phone_number].filter(Boolean).join(' · ') || 'Cloud API доступен',
+          };
+        })
+        .catch((err) => (checks.whatsapp = { ok: false, detail: errorMessage(err) }));
+    }
 
     const price = await loadPriceList();
     checks.price_list = price.available

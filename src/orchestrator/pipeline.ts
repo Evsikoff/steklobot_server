@@ -7,6 +7,7 @@ import { activeProvider, describeModel, type Turn } from '../services/llm/index.
 import { buildRepairPrompt, buildUserPrompt } from '../services/llm/prompt.js';
 import { validateLlmJson } from './jsonGuard.js';
 import * as tg from '../services/telegram.js';
+import { sendCustomerText } from '../services/customerMessaging.js';
 import type { Run, RunStage, Thread } from '../types.js';
 
 export class SupersededError extends Error {
@@ -240,17 +241,20 @@ export async function executeRun(params: {
     // с этого момента прогон считается зафиксированным: даже если придёт
     // новое сообщение, ответ уже уходит клиенту и обрывать его нельзя.
     const deliverStarted = Date.now();
-    const sent = await tg.sendMessage(thread.customer_chat_id, composed.reply, {
-      ctx: { threadId: thread.id, runId: run.id },
-    });
+    const sent = await sendCustomerText(thread, composed.reply, { threadId: thread.id, runId: run.id });
 
     await db.insertMessage({
       thread_id: thread.id,
       role: 'assistant',
       text: composed.reply,
-      tg_message_id: sent.message_id,
+      tg_message_id: sent.telegramMessageId,
       run_id: run.id,
-      meta: { lookupStatus: composed.lookupStatus, matchedPriceIds: composed.matchedRows.map((r) => r.id) },
+      meta: {
+        lookupStatus: composed.lookupStatus,
+        matchedPriceIds: composed.matchedRows.map((r) => r.id),
+        channel: sent.channel,
+        providerMessageId: sent.providerMessageId,
+      },
     });
 
     await db.updateThread(thread.id, {
@@ -268,7 +272,13 @@ export async function executeRun(params: {
         .catch((err) => log.warn('не удалось продублировать ответ в топик', errorMessage(err)));
     }
 
-    stageEvent(run, 'deliver', 'Ответ отправлен клиенту', { tgMessageId: sent.message_id }, Date.now() - deliverStarted);
+    stageEvent(
+      run,
+      'deliver',
+      'Ответ отправлен клиенту',
+      { channel: sent.channel, providerMessageId: sent.providerMessageId },
+      Date.now() - deliverStarted,
+    );
 
     // ---------------------------------------------------------- эскалация
     if (composed.escalate) {
@@ -344,10 +354,10 @@ export async function executeRun(params: {
 
 async function notifyFailure(thread: Thread, run: Run, message: string): Promise<void> {
   try {
-    await tg.sendMessage(
-      thread.customer_chat_id,
+    await sendCustomerText(
+      thread,
       'Извините, произошёл технический сбой. Подключаю менеджера — он ответит вам здесь же.',
-      { ctx: { threadId: thread.id, runId: run.id } },
+      { threadId: thread.id, runId: run.id },
     );
     await db.updateThread(thread.id, { mode: 'human' });
     await db.insertEscalation({

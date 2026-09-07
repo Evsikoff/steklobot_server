@@ -689,6 +689,7 @@ function renderRun(run) {
 
 const SERVICE_LABELS = {
   telegram: 'Telegram',
+  whatsapp: 'WhatsApp',
   gemini: 'LLM · Gemini',
   apibazaar: 'LLM · API Bazaar',
   price_list: 'Прайс-лист',
@@ -700,6 +701,7 @@ const SERVICE_LABELS = {
 };
 
 const SERVICE_HINTS = {
+  whatsapp: 'WhatsApp Business Cloud API через graph.facebook.com',
   gemini: 'Google Gemini через generativelanguage.googleapis.com',
   apibazaar: 'OpenAI-совместимый эндпоинт из API_BAZAAR_URL',
 };

@@ -83,6 +83,20 @@ export const config = {
     ignoredTopicIds: numList('TELEGRAM_IGNORED_TOPIC_IDS', [1, 2]),
   },
 
+  /**
+   * WhatsApp Business Cloud API. Интеграция необязательна: Telegram продолжает
+   * работать, даже пока номер или секреты WhatsApp ещё не подключены.
+   */
+  whatsapp: {
+    phoneNumberId: optional('WHATSAPP_PHONE_NUMBER_ID'),
+    businessAccountId: optional('WHATSAPP_WABA_ID'),
+    accessToken: optional('WHATSAPP_ACCESS_TOKEN'),
+    appSecret: optional('WHATSAPP_APP_SECRET'),
+    verifyToken: optional('WHATSAPP_VERIFY_TOKEN'),
+    apiVersion: optional('WHATSAPP_API_VERSION', 'v26.0'),
+    apiBase: optional('WHATSAPP_API_BASE', 'https://graph.facebook.com'),
+  },
+
   supabase: {
     url: supabaseOrigin(),
     serviceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY'),

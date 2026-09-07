@@ -99,7 +99,7 @@ async function startUpload(
         'x-goog-upload-header-content-length': String(bytes),
         'x-goog-upload-header-content-type': mimeType,
       },
-      body: JSON.stringify({ file: { display_name: `telegram-voice-${Date.now()}.ogg` } }),
+      body: JSON.stringify({ file: { display_name: `customer-voice-${Date.now()}.ogg` } }),
       timeoutMs: remainingMs(deadline, operation),
     },
     { retries: 1, retryDelayMs: 500 },
@@ -356,7 +356,7 @@ async function deleteFile(name: string, model: string, ctx: TranscribeCtx): Prom
   );
 }
 
-/** Ogg/Opus из Telegram → inline Gemini (с Files API как резервом) → текст. */
+/** Аудио клиента → inline Gemini (с Files API как резервом) → текст. */
 export async function transcribeVoice(audio: Uint8Array, ctx: TranscribeCtx = {}): Promise<TranscribeResult> {
   const ready = transcribeReadiness();
   if (!ready.ok) throw new ExternalError('gemini', 'transcribe', `Распознавание недоступно: ${ready.reason}`);

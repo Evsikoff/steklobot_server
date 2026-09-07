@@ -35,6 +35,52 @@ async function call<T>(
   return (res.body as { result: T }).result;
 }
 
+async function callWithFile<T>(
+  method: string,
+  payload: Record<string, string | number>,
+  file: { field: string; bytes: Uint8Array; filename: string; mimeType: string },
+  ctx: CallCtx = {},
+): Promise<T> {
+  const requestSummary = { ...payload, [file.field]: { filename: file.filename, mimeType: file.mimeType, bytes: file.bytes.length } };
+  return tracked(
+    { service: 'telegram', operation: method, threadId: ctx.threadId, runId: ctx.runId, request: requestSummary },
+    async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30_000);
+      try {
+        const form = new FormData();
+        for (const [key, value] of Object.entries(payload)) form.append(key, String(value));
+        form.append(file.field, new Blob([new Uint8Array(file.bytes)], { type: file.mimeType }), file.filename);
+        const res = await fetch(api(method), { method: 'POST', body: form, signal: controller.signal });
+        const text = await res.text();
+        let body: { ok?: boolean; result?: T; description?: string } = {};
+        try {
+          body = text ? (JSON.parse(text) as typeof body) : {};
+        } catch {
+          // Ошибка ниже сохранит безопасное краткое описание ответа.
+        }
+        if (!res.ok || !body.ok || body.result == null) {
+          throw new ExternalError(
+            'telegram',
+            method,
+            `HTTP ${res.status}: ${body.description || summarizeBody(text) || 'Telegram не принял файл'}`,
+            res.status,
+            body,
+          );
+        }
+        const messageId = (body.result as unknown as { message_id?: number }).message_id;
+        return { value: body.result, httpStatus: res.status, response: { ok: true, message_id: messageId } };
+      } catch (err) {
+        if (err instanceof ExternalError) throw err;
+        if ((err as Error)?.name === 'AbortError') throw new ExternalError('telegram', method, 'Таймаут 30000 мс');
+        throw new ExternalError('telegram', method, `Сетевая ошибка: ${(err as Error)?.message ?? String(err)}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  );
+}
+
 /** Голосовое сообщение: Telegram всегда отдаёт его в Ogg/Opus */
 export interface TgVoice {
   file_id: string;
@@ -122,6 +168,50 @@ export async function copyMessage(
   };
   if (opts.messageThreadId != null) payload.message_thread_id = opts.messageThreadId;
   return call<{ message_id: number }>('copyMessage', payload, opts.ctx ?? {});
+}
+
+/** Загружает фото из другого канала в топик менеджеров. */
+export async function sendPhotoBytes(
+  chatId: string | number,
+  bytes: Uint8Array,
+  opts: { messageThreadId?: number | null; caption?: string; mimeType?: string; ctx?: CallCtx } = {},
+): Promise<TgMessage> {
+  const payload: Record<string, string | number> = { chat_id: String(chatId) };
+  if (opts.messageThreadId != null) payload.message_thread_id = opts.messageThreadId;
+  if (opts.caption) {
+    payload.caption = escapeHtml(opts.caption).slice(0, 1024);
+    payload.parse_mode = 'HTML';
+  }
+  const mimeType = opts.mimeType || 'image/jpeg';
+  const ext = mimeType.includes('png') ? 'png' : mimeType.includes('webp') ? 'webp' : 'jpg';
+  return callWithFile<TgMessage>('sendPhoto', payload, { field: 'photo', bytes, filename: `whatsapp-photo.${ext}`, mimeType }, opts.ctx);
+}
+
+/** Загружает голосовое из WhatsApp в топик менеджеров для проверки расшифровки. */
+export async function sendVoiceBytes(
+  chatId: string | number,
+  bytes: Uint8Array,
+  opts: { messageThreadId?: number | null; caption?: string; mimeType?: string; ctx?: CallCtx } = {},
+): Promise<TgMessage> {
+  const payload: Record<string, string | number> = { chat_id: String(chatId) };
+  if (opts.messageThreadId != null) payload.message_thread_id = opts.messageThreadId;
+  if (opts.caption) {
+    payload.caption = escapeHtml(opts.caption).slice(0, 1024);
+    payload.parse_mode = 'HTML';
+  }
+  const mimeType = opts.mimeType || 'audio/ogg';
+  const isVoiceFormat = /audio\/(ogg|opus)/i.test(mimeType);
+  return callWithFile<TgMessage>(
+    isVoiceFormat ? 'sendVoice' : 'sendDocument',
+    payload,
+    {
+      field: isVoiceFormat ? 'voice' : 'document',
+      bytes,
+      filename: isVoiceFormat ? 'whatsapp-voice.ogg' : 'whatsapp-audio',
+      mimeType,
+    },
+    opts.ctx,
+  );
 }
 
 export async function createForumTopic(name: string, ctx: CallCtx = {}): Promise<{ message_thread_id: number }> {
