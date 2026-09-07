@@ -11,6 +11,8 @@ import { handleUpdate, sendAsManager } from '../ingest.js';
 import { cancelActive, orchestratorSnapshot } from '../orchestrator/index.js';
 import { invalidatePriceCache, loadPriceList, priceListStatus } from '../services/priceList.js';
 import { activeProvider, applyProvider, getProvider, isProviderId, providersOverview } from '../services/llm/index.js';
+import { transcribeModel, transcribeReadiness } from '../services/transcribe.js';
+import { visionModel, visionReadiness } from '../services/vision.js';
 import { log, errorMessage } from '../logger.js';
 import { checkPassword, clearSessionCookie, isAuthenticated, issueToken, requireAuth, setSessionCookie } from './auth.js';
 
@@ -213,6 +215,16 @@ export function createServer(): http.Server {
     checks.price_list = price.available
       ? { ok: true, detail: `${price.rows.length} строк${price.fromCache ? ' (кэш)' : ''}` }
       : { ok: false, detail: price.error ?? 'Прайс недоступен' };
+
+    const transcribe = transcribeReadiness();
+    checks.transcribe = transcribe.ok
+      ? { ok: true, detail: `модель ${transcribeModel()}` }
+      : { ok: false, detail: transcribe.reason ?? 'недоступно' };
+
+    const vision = visionReadiness();
+    checks.vision = vision.ok
+      ? { ok: true, detail: `модель ${visionModel()}` }
+      : { ok: false, detail: vision.reason ?? 'недоступно' };
 
     for (const p of providersOverview()) {
       checks[`llm_${p.id}`] = {

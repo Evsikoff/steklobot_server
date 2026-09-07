@@ -2,6 +2,8 @@ import { config } from './config.js';
 import * as db from './db.js';
 import * as tg from './services/telegram.js';
 import { enqueue, cancelActive } from './orchestrator/index.js';
+import { transcribeReadiness, transcribeVoice } from './services/transcribe.js';
+import { describeCarPhoto, photoSummary, photoToPromptText, visionReadiness } from './services/vision.js';
 import { log, errorMessage } from './logger.js';
 import type { Thread } from './types.js';
 
@@ -46,24 +48,150 @@ function textOf(message: tg.TgMessage): string {
   return (message.text ?? message.caption ?? '').trim();
 }
 
+/** 75 → «1:15» */
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/** Скачивает файл клиента по file_id */
+async function fetchFile(fileId: string, thread: Thread, maxBytes: number): Promise<Buffer> {
+  const file = await tg.getFile(fileId, { threadId: thread.id });
+  if (!file.file_path) throw new Error('Telegram не отдал путь к файлу');
+  return tg.downloadFile(file.file_path, { threadId: thread.id }, { maxBytes });
+}
+
+/** Скачивает голосовое из Telegram и расшифровывает его Gemini Transcribe Live */
+async function transcribeVoiceMessage(voice: tg.TgVoice, thread: Thread): Promise<string> {
+  if (voice.duration > config.transcribe.maxDurationSec) {
+    throw new Error(`запись длиннее ${config.transcribe.maxDurationSec} с`);
+  }
+  if (voice.file_size != null && voice.file_size > config.transcribe.maxFileBytes) {
+    throw new Error(`файл больше ${config.transcribe.maxFileBytes} байт`);
+  }
+
+  const audio = await fetchFile(voice.file_id, thread, config.transcribe.maxFileBytes);
+  const result = await transcribeVoice(audio, { threadId: thread.id });
+
+  log.info('голосовое распознано', {
+    threadId: thread.id,
+    model: result.model,
+    durationSec: Math.round(result.durationSec),
+    chars: result.text.length,
+  });
+  return result.text;
+}
+
+/**
+ * Картинка в сообщении: либо сжатое фото (берём самый крупный вариант),
+ * либо изображение, отправленное файлом «без сжатия».
+ */
+function imageOf(message: tg.TgMessage): { fileId: string; mimeType: string; fileSize?: number } | null {
+  const photo = message.photo?.length ? message.photo[message.photo.length - 1] : null;
+  if (photo) return { fileId: photo.file_id, mimeType: 'image/jpeg', fileSize: photo.file_size };
+
+  const doc = message.document;
+  if (doc?.mime_type && /^image\/(jpeg|png|webp|heic|heif)$/i.test(doc.mime_type)) {
+    return { fileId: doc.file_id, mimeType: doc.mime_type.toLowerCase(), fileSize: doc.file_size };
+  }
+  return null;
+}
+
 /** Сообщение от клиента в личке бота */
 export async function handleCustomerMessage(message: tg.TgMessage): Promise<void> {
   const thread = await ensureThread(message);
-  const text = textOf(message);
+  let text = textOf(message);
+  let meta: Record<string, unknown> | undefined;
+  let mirrorPrefix = '👤 Клиент';
+
+  // голосовое без подписи — распознаём и дальше ведём как обычный текст
+  if (!text && message.voice && transcribeReadiness().ok) {
+    const stamp = formatDuration(message.voice.duration);
+    try {
+      text = await transcribeVoiceMessage(message.voice, thread);
+      meta = { source: 'voice', duration_sec: message.voice.duration, file_unique_id: message.voice.file_unique_id };
+      mirrorPrefix = `🎤 Клиент (голосовое ${stamp})`;
+    } catch (err) {
+      const reason = errorMessage(err);
+      log.warn('не удалось распознать голосовое', { threadId: thread.id, error: reason });
+      if (thread.topic_id != null) {
+        await tg
+          .sendMessage(config.telegram.managerChatId, `🎤 Клиент прислал голосовое ${stamp}, распознать не удалось: ${reason}. Нужен ответ менеджера.`, {
+            messageThreadId: thread.topic_id,
+            ctx: { threadId: thread.id },
+          })
+          .catch(() => undefined);
+      }
+      await tg
+        .sendMessage(thread.customer_chat_id, 'Не получилось разобрать голосовое сообщение. Напишите, пожалуйста, текстом — или дождитесь менеджера.', {
+          ctx: { threadId: thread.id },
+        })
+        .catch(() => undefined);
+      return;
+    }
+  }
+
+  // фото автомобиля — распознаём и добавляем блоком к подписи клиента
+  const image = imageOf(message);
+  if (image && visionReadiness().ok) {
+    try {
+      if (image.fileSize != null && image.fileSize > config.vision.maxFileBytes) {
+        throw new Error(`файл больше ${config.vision.maxFileBytes} байт`);
+      }
+      const bytes = await fetchFile(image.fileId, thread, config.vision.maxFileBytes);
+      const photo = await describeCarPhoto(bytes, image.mimeType, { threadId: thread.id });
+      text = [text, photoToPromptText(photo)].filter(Boolean).join('\n');
+      meta = { source: 'photo', vision: photo };
+      mirrorPrefix = `🖼 Клиент (фото — ${photoSummary(photo)})`;
+    } catch (err) {
+      const reason = errorMessage(err);
+      log.warn('не удалось распознать фото', { threadId: thread.id, error: reason });
+      if (thread.topic_id != null) {
+        await tg
+          .sendMessage(config.telegram.managerChatId, `🖼 Клиент прислал фото, распознать не удалось: ${reason}.`, {
+            messageThreadId: thread.topic_id,
+            ctx: { threadId: thread.id },
+          })
+          .catch(() => undefined);
+      }
+      // с подписью диалог продолжается по тексту, без подписи — зовём менеджера
+      if (!text) {
+        await tg
+          .sendMessage(thread.customer_chat_id, 'Не получилось разобрать фото. Напишите, пожалуйста, марку, модель и год автомобиля — или дождитесь менеджера.', {
+            ctx: { threadId: thread.id },
+          })
+          .catch(() => undefined);
+        return;
+      }
+    }
+  }
 
   if (!text) {
     if (thread.topic_id != null) {
+      const kind = message.voice ? `голосовое ${formatDuration(message.voice.duration)}` : 'вложение';
       await tg
-        .sendMessage(config.telegram.managerChatId, '👤 Клиент прислал вложение без текста — нужен ответ менеджера.', {
+        .sendMessage(config.telegram.managerChatId, `👤 Клиент прислал ${kind} без текста — нужен ответ менеджера.`, {
           messageThreadId: thread.topic_id,
           ctx: { threadId: thread.id },
         })
         .catch(() => undefined);
     }
     await tg
-      .sendMessage(thread.customer_chat_id, 'Я пока понимаю только текст. Опишите, пожалуйста, запрос сообщением.', {
-        ctx: { threadId: thread.id },
-      })
+      .sendMessage(
+        thread.customer_chat_id,
+        [
+          'Я пока понимаю',
+          [
+            'текст',
+            transcribeReadiness().ok ? 'голосовые' : null,
+            visionReadiness().ok ? 'фото автомобиля' : null,
+          ]
+            .filter(Boolean)
+            .join(', '),
+          '— опишите, пожалуйста, запрос сообщением.',
+        ].join(' '),
+        { ctx: { threadId: thread.id } },
+      )
       .catch(() => undefined);
     return;
   }
@@ -73,13 +201,14 @@ export async function handleCustomerMessage(message: tg.TgMessage): Promise<void
     role: 'customer',
     text,
     tg_message_id: message.message_id,
+    meta,
   });
 
   await db.updateThread(thread.id, { last_message_at: new Date().toISOString(), last_message_text: text });
 
   if (thread.topic_id != null) {
     await tg
-      .sendMessage(config.telegram.managerChatId, `👤 Клиент: ${text}`, {
+      .sendMessage(config.telegram.managerChatId, `${mirrorPrefix}: ${text}`, {
         messageThreadId: thread.topic_id,
         ctx: { threadId: thread.id },
       })
