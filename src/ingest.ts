@@ -106,28 +106,42 @@ interface Recognized {
 
 /**
  * Голосовое и фото автомобиля бот читает сам, и заявка идёт обычным путём.
- * null — это другое вложение либо распознать не удалось: тогда сообщение
- * уходит менеджеру целиком, как и всё, что бот прочитать не может.
+ * Пустой result — это другое вложение либо распознать не удалось: тогда
+ * сообщение уходит менеджеру целиком, как и всё, что бот прочитать не может,
+ * а reason объясняет менеджеру в топике, почему бот не справился.
  */
-async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Recognized | null> {
+interface Recognition {
+  result: Recognized | null;
+  reason: string | null;
+}
+
+async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Recognition> {
   const caption = textOf(message);
 
-  if (message.voice && transcribeReadiness().ok) {
+  if (message.voice) {
+    const ready = transcribeReadiness();
+    if (!ready.ok) return { result: null, reason: ready.reason };
     try {
       const transcript = await transcribeVoiceMessage(message.voice, thread);
       return {
-        text: [caption, transcript].filter(Boolean).join('\n'),
-        meta: { source: 'voice', duration_sec: message.voice.duration, file_unique_id: message.voice.file_unique_id },
-        mirrorPrefix: `🎤 Расшифровка (голосовое ${formatDuration(message.voice.duration)})`,
+        result: {
+          text: [caption, transcript].filter(Boolean).join('\n'),
+          meta: { source: 'voice', duration_sec: message.voice.duration, file_unique_id: message.voice.file_unique_id },
+          mirrorPrefix: `🎤 Расшифровка (голосовое ${formatDuration(message.voice.duration)})`,
+        },
+        reason: null,
       };
     } catch (err) {
-      log.warn('не удалось распознать голосовое, отдаём менеджеру', { threadId: thread.id, error: errorMessage(err) });
-      return null;
+      const reason = errorMessage(err);
+      log.warn('не удалось распознать голосовое, отдаём менеджеру', { threadId: thread.id, error: reason });
+      return { result: null, reason };
     }
   }
 
   const image = imageOf(message);
-  if (image && visionReadiness().ok) {
+  if (image) {
+    const ready = visionReadiness();
+    if (!ready.ok) return { result: null, reason: ready.reason };
     try {
       if (image.fileSize != null && image.fileSize > config.vision.maxFileBytes) {
         throw new Error(`файл больше ${config.vision.maxFileBytes} байт`);
@@ -136,21 +150,26 @@ async function recognizeMedia(thread: Thread, message: tg.TgMessage): Promise<Re
       const photo = await describeCarPhoto(bytes, image.mimeType, { threadId: thread.id });
       // ни марки, ни модели — подбирать не по чему, пусть смотрит менеджер
       if (!photo.isCar || (!photo.make && !photo.model)) {
-        log.info('на фото не распознан автомобиль, отдаём менеджеру', { threadId: thread.id });
-        return null;
+        const reason = photo.isCar ? 'модель не смогла определить марку' : 'на снимке не видно автомобиля';
+        log.info('фото не даёт данных для подбора, отдаём менеджеру', { threadId: thread.id, reason });
+        return { result: null, reason };
       }
       return {
-        text: [caption, photoToPromptText(photo)].filter(Boolean).join('\n'),
-        meta: { source: 'photo', vision: photo },
-        mirrorPrefix: `🖼 Распознано на фото (${photoSummary(photo)})`,
+        result: {
+          text: [caption, photoToPromptText(photo)].filter(Boolean).join('\n'),
+          meta: { source: 'photo', vision: photo },
+          mirrorPrefix: `🖼 Распознано на фото (${photoSummary(photo)})`,
+        },
+        reason: null,
       };
     } catch (err) {
-      log.warn('не удалось распознать фото, отдаём менеджеру', { threadId: thread.id, error: errorMessage(err) });
-      return null;
+      const reason = errorMessage(err);
+      log.warn('не удалось распознать фото, отдаём менеджеру', { threadId: thread.id, error: reason });
+      return { result: null, reason };
     }
   }
 
-  return null;
+  return { result: null, reason: null };
 }
 
 /**
@@ -203,6 +222,7 @@ async function handleUnreadableMessage(
   thread: Thread,
   message: tg.TgMessage,
   attachment: AttachmentKind | null,
+  failure: string | null = null,
 ): Promise<void> {
   const caption = textOf(message);
   const name = attachment?.name ?? 'вложение';
@@ -226,9 +246,12 @@ async function handleUnreadableMessage(
       last_message_text: caption ? `${caption} ${marker}` : marker,
     });
 
+    // без причины менеджер видит только «бот такое не читает» и не понимает,
+    // сломалось распознавание или этот тип вложения бот и не должен читать
+    const why = failure ? ` Распознать не удалось: ${failure}.` : '';
     const header = needsManager
-      ? `👤 Клиент прислал ${name} — бот такое не читает, дальше отвечает менеджер.`
-      : `👤 Клиент прислал ${name}.`;
+      ? `👤 Клиент прислал ${name} — бот такое не читает, дальше отвечает менеджер.${why}`
+      : `👤 Клиент прислал ${name}.${why}`;
     await tg
       .sendMessage(config.telegram.managerChatId, header, mirror)
       .catch((err) => log.warn('не удалось предупредить менеджера о вложении', errorMessage(err)));
@@ -273,11 +296,14 @@ export async function handleCustomerMessage(message: tg.TgMessage): Promise<void
 
   // голосовое и фото автомобиля бот распознаёт сам; остальные вложения — и всё,
   // что распознать не вышло, — уходят менеджеру вместе с самим файлом
-  const recognized = attachment ? await recognizeMedia(thread, message) : null;
+  const recognition: Recognition = attachment
+    ? await recognizeMedia(thread, message)
+    : { result: null, reason: null };
+  const recognized = recognition.result;
   const text = recognized ? recognized.text : textOf(message);
 
   if (!text || (attachment && !recognized)) {
-    await handleUnreadableMessage(thread, message, attachment);
+    await handleUnreadableMessage(thread, message, attachment, recognition.reason);
     return;
   }
 

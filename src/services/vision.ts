@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { ExternalError, httpJson } from './external.js';
+import { ExternalError, httpJson, tracked } from './external.js';
 
 /**
  * Распознавание фото автомобиля обычной мультимодальной Gemini (GEMINI_MODEL).
@@ -115,7 +115,11 @@ export async function describeCarPhoto(image: Uint8Array, mimeType: string, ctx:
         ],
       },
     ],
-    generationConfig: { temperature: 0, maxOutputTokens: 512, responseMimeType: 'application/json' },
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: config.vision.maxOutputTokens,
+      responseMimeType: 'application/json',
+    },
   };
 
   const res = await httpJson(
@@ -145,25 +149,47 @@ export async function describeCarPhoto(image: Uint8Array, mimeType: string, ctx:
     throw new ExternalError('gemini', operation, `Фото заблокировано моделью: ${body.promptFeedback.blockReason}`, res.status, body);
   }
 
-  const candidate = body.candidates?.[0];
-  const text = (candidate?.content?.parts ?? []).map((part) => part.text ?? '').join('').trim();
-  if (!text) {
-    throw new ExternalError(
-      'gemini',
-      operation,
-      `Модель вернула пустой ответ (finishReason=${candidate?.finishReason ?? 'unknown'})`,
-      res.status,
-      body,
-    );
-  }
+  // Разбор ответа — отдельное событие журнала: HTTP уже вернул 200, поэтому
+  // пустой ответ или неразобранный JSON иначе нигде бы не отразились, и отказ
+  // распознавания выглядел бы как «вызовов с ошибкой нет».
+  return tracked(
+    {
+      service: 'gemini',
+      operation: `${operation}:parse`,
+      threadId: ctx.threadId,
+      runId: ctx.runId,
+      request: { model, finishReason: body.candidates?.[0]?.finishReason ?? null },
+    },
+    async () => {
+      const candidate = body.candidates?.[0];
+      const text = (candidate?.content?.parts ?? []).map((part) => part.text ?? '').join('').trim();
 
-  try {
-    return normalize(parseJson(text));
-  } catch (err) {
-    throw new ExternalError('gemini', operation, `Не разобрать ответ модели: ${(err as Error).message}`, res.status, {
-      raw: text.slice(0, 1000),
-    });
-  }
+      if (!text) {
+        const finishReason = candidate?.finishReason ?? 'unknown';
+        const hint =
+          finishReason === 'MAX_TOKENS'
+            ? ` — весь бюджет ушёл на рассуждение модели, поднимите VISION_MAX_OUTPUT_TOKENS (сейчас ${config.vision.maxOutputTokens})`
+            : '';
+        throw new ExternalError(
+          'gemini',
+          operation,
+          `Модель вернула пустой ответ (finishReason=${finishReason})${hint}`,
+          res.status,
+          body,
+        );
+      }
+
+      let photo: CarPhoto;
+      try {
+        photo = normalize(parseJson(text));
+      } catch (err) {
+        throw new ExternalError('gemini', operation, `Не разобрать ответ модели: ${(err as Error).message}`, res.status, {
+          raw: text.slice(0, 1000),
+        });
+      }
+      return { value: photo, httpStatus: res.status, response: photo };
+    },
+  );
 }
 
 const CONFIDENCE_LABEL: Record<CarPhoto['confidence'], string> = {
