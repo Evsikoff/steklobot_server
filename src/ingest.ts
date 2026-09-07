@@ -46,25 +46,129 @@ function textOf(message: tg.TgMessage): string {
   return (message.text ?? message.caption ?? '').trim();
 }
 
+/**
+ * Вложения бот не читает, а фото или голосовое часто и есть сама заявка.
+ * Такое сообщение копируем менеджеру целиком и отдаём ему диалог.
+ * needsManager = false у стикеров и GIF: забирать диалог из-за смайлика незачем.
+ * Названия — в винительном падеже: подставляются в «прислал …» и «передал … менеджеру».
+ */
+const ATTACHMENT_KINDS: { field: keyof tg.TgMessage; name: string; needsManager: boolean }[] = [
+  { field: 'photo', name: 'фото', needsManager: true },
+  { field: 'voice', name: 'голосовое сообщение', needsManager: true },
+  { field: 'video_note', name: 'видеосообщение', needsManager: true },
+  { field: 'video', name: 'видео', needsManager: true },
+  { field: 'audio', name: 'аудио', needsManager: true },
+  { field: 'document', name: 'файл', needsManager: true },
+  { field: 'location', name: 'геопозицию', needsManager: true },
+  { field: 'contact', name: 'контакт', needsManager: true },
+  { field: 'animation', name: 'GIF', needsManager: false },
+  { field: 'sticker', name: 'стикер', needsManager: false },
+];
+
+type AttachmentKind = (typeof ATTACHMENT_KINDS)[number];
+
+const attachmentOf = (message: tg.TgMessage): AttachmentKind | null =>
+  ATTACHMENT_KINDS.find((kind) => message[kind.field] != null) ?? null;
+
+/**
+ * Альбом приходит несколькими апдейтами с общим media_group_id: копию в топик
+ * делаем для каждого файла, а отвечать клиенту и заводить запрос менеджеру — один раз.
+ */
+const seenMediaGroups = new Map<string, number>();
+const MEDIA_GROUP_TTL_MS = 60_000;
+
+function isFirstInMediaGroup(groupId: string | undefined): boolean {
+  if (!groupId) return true;
+  const now = Date.now();
+  for (const [id, at] of seenMediaGroups) if (now - at > MEDIA_GROUP_TTL_MS) seenMediaGroups.delete(id);
+  if (seenMediaGroups.has(groupId)) return false;
+  seenMediaGroups.set(groupId, now);
+  return true;
+}
+
+/**
+ * Сообщение, которое бот прочитать не может: вложение или сообщение без текста.
+ * Раньше клиент получал отписку «понимаю только текст», а менеджер — строчку в топике
+ * без самого файла, и заявка терялась. Теперь файл уходит в топик как есть,
+ * факт пишется в историю, а диалог переводится на менеджера.
+ */
+async function handleUnreadableMessage(
+  thread: Thread,
+  message: tg.TgMessage,
+  attachment: AttachmentKind | null,
+): Promise<void> {
+  const caption = textOf(message);
+  const name = attachment?.name ?? 'вложение';
+  const needsManager = attachment?.needsManager ?? true;
+  const marker = `[${name}]`;
+  const first = isFirstInMediaGroup(message.media_group_id);
+  // топика может не быть (не создался) — тогда копия уйдёт в General, но не пропадёт
+  const mirror = { messageThreadId: thread.topic_id, ctx: { threadId: thread.id } };
+
+  if (first) {
+    await db.insertMessage({
+      thread_id: thread.id,
+      role: 'customer',
+      text: caption ? `${caption}\n${marker}` : marker,
+      tg_message_id: message.message_id,
+      meta: { attachment: name, mediaGroupId: message.media_group_id ?? null },
+    });
+    await db.updateThread(thread.id, {
+      ...(needsManager ? { mode: 'human' as const } : {}),
+      last_message_at: new Date().toISOString(),
+      last_message_text: caption ? `${caption} ${marker}` : marker,
+    });
+
+    const header = needsManager
+      ? `👤 Клиент прислал ${name} — бот такое не читает, дальше отвечает менеджер.`
+      : `👤 Клиент прислал ${name}.`;
+    await tg
+      .sendMessage(config.telegram.managerChatId, header, mirror)
+      .catch((err) => log.warn('не удалось предупредить менеджера о вложении', errorMessage(err)));
+  }
+
+  // копия нужна для каждого файла: у альбома каждое фото приходит отдельным апдейтом
+  const copied = await tg
+    .copyMessage(config.telegram.managerChatId, thread.customer_chat_id, message.message_id, mirror)
+    .catch((err) => {
+      log.warn('не удалось переслать вложение менеджеру', errorMessage(err));
+      return null;
+    });
+  if (!copied) {
+    await tg
+      .sendMessage(config.telegram.managerChatId, '⚠️ Вложение переслать не удалось — откройте диалог с клиентом.', mirror)
+      .catch(() => undefined);
+  }
+
+  if (!needsManager || !first) return;
+
+  // прогон по прошлым сообщениям уже не нужен: диалог ведёт человек
+  cancelActive(thread.id, 'клиент прислал вложение');
+  await db.insertEscalation({
+    thread_id: thread.id,
+    run_id: null,
+    reason: 'attachment_received',
+    summary: `Клиент прислал ${name}${caption ? ` с подписью: ${caption}` : ''} — бот такое не читает, нужен менеджер.`,
+    context: { attachment: name, caption, tgMessageId: message.message_id },
+  });
+
+  await tg
+    .sendMessage(thread.customer_chat_id, `Я пока не открываю вложения — передал ${name} менеджеру, он ответит здесь же.`, {
+      ctx: { threadId: thread.id },
+    })
+    .catch((err) => log.warn('не удалось ответить клиенту на вложение', errorMessage(err)));
+}
+
 /** Сообщение от клиента в личке бота */
 export async function handleCustomerMessage(message: tg.TgMessage): Promise<void> {
   const thread = await ensureThread(message);
   const text = textOf(message);
+  const attachment = attachmentOf(message);
 
-  if (!text) {
-    if (thread.topic_id != null) {
-      await tg
-        .sendMessage(config.telegram.managerChatId, '👤 Клиент прислал вложение без текста — нужен ответ менеджера.', {
-          messageThreadId: thread.topic_id,
-          ctx: { threadId: thread.id },
-        })
-        .catch(() => undefined);
-    }
-    await tg
-      .sendMessage(thread.customer_chat_id, 'Я пока понимаю только текст. Опишите, пожалуйста, запрос сообщением.', {
-        ctx: { threadId: thread.id },
-      })
-      .catch(() => undefined);
+  // фото с подписью тоже сюда: подпись бот прочитает, а картинку — нет,
+  // и отвечать по половине заявки хуже, чем отдать её менеджеру
+  if (attachment || !text) {
+    await handleUnreadableMessage(thread, message, attachment);
     return;
   }
 
