@@ -153,6 +153,11 @@ export const config = {
     model: optional('VISION_MODEL', optional('GEMINI_MODEL', 'gemini-3.7-flash')),
     maxFileBytes: num('VISION_MAX_FILE_BYTES', 20 * 1024 * 1024),
     timeoutMs: num('VISION_TIMEOUT_MS', 45_000),
+    /**
+     * С запасом: у думающих моделей рассуждение тратится из этого же лимита,
+     * и на тесном бюджете ответ приходит пустым с finishReason=MAX_TOKENS.
+     */
+    maxOutputTokens: num('VISION_MAX_OUTPUT_TOKENS', 2048),
   },
 
   orchestrator: {
