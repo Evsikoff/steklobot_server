@@ -18,6 +18,26 @@ const featureNames = (value: string) =>
     .map((item) => FEATURE_NAMES[item.trim()] ?? item.trim())
     .join(', ');
 
+/**
+ * Тексты, которыми предупреждаем клиента, что дальше отвечает человек.
+ * Без них клиент видит только ответ модели (а в ветке с ценами — один прайс)
+ * и не понимает, что тред уже переведён в ручной режим и нужно подождать.
+ */
+const HANDOFF_NOTICES: Record<string, string> = {
+  deal_ready: 'Передаю заявку менеджеру — он свяжется с вами здесь, подтвердит наличие и запишет на замену.',
+  not_in_stock: 'Подключаю менеджера — он подберёт альтернативы и ответит вам здесь же.',
+};
+const DEFAULT_HANDOFF_NOTICE = 'Подключаю менеджера — он ответит вам здесь же.';
+
+/** уже сказали про менеджера — второй раз не повторяем */
+const mentionsHandoff = (reply: string) => /менеджер/i.test(reply);
+
+function withHandoffNotice(reply: string, escalate: Escalate | null): string {
+  if (!escalate || mentionsHandoff(reply)) return reply;
+  const notice = HANDOFF_NOTICES[escalate.reason] ?? DEFAULT_HANDOFF_NOTICE;
+  return reply ? [reply, notice].join('\n') : notice;
+}
+
 export interface ComposeInput {
   answer: LlmAnswer;
   priceRows: PriceRow[];
@@ -103,6 +123,9 @@ export function composeReply(input: ComposeInput): ComposeResult {
   } else if (lookupStatus === 'need_details' && !reply) {
     reply = 'Уточните, пожалуйста, марку, модель, год автомобиля и какое стекло требуется: лобовое, заднее или боковое?';
   }
+
+  // тред уходит в ручной режим — клиент должен знать, что ждёт менеджера
+  reply = withHandoffNotice(reply, escalate);
 
   if (!reply) reply = 'Чем могу помочь с подбором автостекла?';
 
